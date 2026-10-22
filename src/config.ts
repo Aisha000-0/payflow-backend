@@ -201,7 +201,7 @@ const schema = z.object({
   // variable blank, and a container that reads it must not refuse to start
   // over a URL that is not there.
   OTEL_EXPORTER_OTLP_ENDPOINT: z
-    .union([z.literal(""), z.string().url()])
+    .union([z.literal(""), z.url()])
     .optional()
     .transform((value) => (value === "" ? undefined : value)),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
@@ -353,7 +353,7 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
 function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): NetworkConfig {
   const prefix = name.toUpperCase().replace(/-/g, "_");
   const schema = z.object({
-    [`${prefix}_SOROBAN_RPC_URL`]: z.string().url(),
+    [`${prefix}_SOROBAN_RPC_URL`]: z.url(),
     [`${prefix}_NETWORK_PASSPHRASE`]: z.string().min(1),
     [`${prefix}_PLAN_REGISTRY_ID`]: contractId,
     [`${prefix}_VAULT_ID`]: contractId,
