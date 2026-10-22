@@ -382,7 +382,16 @@ export function getProtocolFeeHistory(db: DatabaseSync): ProtocolResponse {
         ORDER BY ledger DESC, rowid DESC`,
     )
     .all() as unknown as ProtocolResponse["history"];
-  return { fee_bps: history[0]?.new_fee_bps ?? null, history };
+  // The newest upgrade per contract; empty until a contract has been upgraded.
+  const contract_versions = db
+    .prepare(
+      `SELECT contract_id, new_hash AS wasm_hash, ledger
+         FROM contract_upgrades u
+        WHERE ledger = (SELECT MAX(ledger) FROM contract_upgrades WHERE contract_id = u.contract_id)
+        ORDER BY contract_id`,
+    )
+    .all() as unknown as ProtocolResponse["contract_versions"];
+  return { fee_bps: history[0]?.new_fee_bps ?? null, history, contract_versions };
 }
 
 /**
@@ -995,4 +1004,29 @@ export function listMandateTimeline(db: DatabaseSync, mandateId: number): Mandat
   return db.prepare(
     "SELECT mandate_id, tx_hash, kind, ledger, at, details FROM mandate_timeline WHERE mandate_id = ? ORDER BY ledger ASC, tx_hash ASC, kind ASC",
   ).all(mandateId) as unknown as MandateTimelineRow[];
+}
+
+/** Contract upgrade history. */
+export interface ContractUpgradeRow {
+  contract_id: string;
+  tx_hash: string;
+  ledger: number;
+  close_time: number;
+  new_hash: string;
+  old_hash: string | null;
+}
+
+export function listContractUpgrades(
+  db: DatabaseSync,
+  contractId?: string,
+  limit: number = 100,
+): ContractUpgradeRow[] {
+  if (contractId === undefined) {
+    return db.prepare(
+      "SELECT contract_id, tx_hash, ledger, close_time, new_hash, old_hash FROM contract_upgrades ORDER BY ledger DESC LIMIT ?",
+    ).all(limit) as unknown as ContractUpgradeRow[];
+  }
+  return db.prepare(
+    "SELECT contract_id, tx_hash, ledger, close_time, new_hash, old_hash FROM contract_upgrades WHERE contract_id = ? ORDER BY ledger DESC LIMIT ?",
+  ).all(contractId, limit) as unknown as ContractUpgradeRow[];
 }

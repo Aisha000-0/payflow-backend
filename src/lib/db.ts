@@ -203,6 +203,19 @@ CREATE TABLE IF NOT EXISTS webhook_attempts (
   attempted_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS webhook_attempts_webhook ON webhook_attempts(webhook_id, id);
+
+-- Contract upgrade history. Records when contracts are upgraded with new code.
+CREATE TABLE IF NOT EXISTS contract_upgrades (
+  contract_id TEXT    NOT NULL,
+  tx_hash     TEXT    NOT NULL,
+  ledger      INTEGER NOT NULL,
+  close_time  INTEGER NOT NULL,
+  new_hash    TEXT    NOT NULL,
+  old_hash    TEXT,
+  PRIMARY KEY (contract_id, ledger, tx_hash)
+);
+CREATE INDEX IF NOT EXISTS contract_upgrades_contract ON contract_upgrades(contract_id, ledger DESC);
+CREATE INDEX IF NOT EXISTS contract_upgrades_ledger ON contract_upgrades(ledger DESC);
 `;
 
 /**
@@ -291,6 +304,15 @@ export interface StoredContractEvent {
   closeTime: number | null;
 }
 
+export interface ContractUpgrade {
+  contractId: string;
+  txHash: string;
+  ledger: number;
+  closeTime: number;
+  newHash: string;
+  oldHash?: string | undefined;
+}
+
 export function saveContractEvent(db: DatabaseSync, event: StoredContractEvent): void {
   db.prepare(`INSERT OR IGNORE INTO events
     (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
@@ -300,10 +322,19 @@ export function saveContractEvent(db: DatabaseSync, event: StoredContractEvent):
   );
 }
 
+export function saveContractUpgrade(db: DatabaseSync, upgrade: ContractUpgrade): void {
+  db.prepare(`INSERT OR IGNORE INTO contract_upgrades
+    (contract_id, tx_hash, ledger, close_time, new_hash, old_hash)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(
+    upgrade.contractId, upgrade.txHash, upgrade.ledger, upgrade.closeTime,
+    upgrade.newHash, upgrade.oldHash ?? null,
+  );
+}
+
 export function clearProjections(db: DatabaseSync): void {
   // Do not remove cursor, raw events, or operational webhook configuration.
   for (const table of [
-    "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline",
+    "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline", "contract_upgrades",
   ]) {
     db.exec(`DELETE FROM ${table}`);
   }
