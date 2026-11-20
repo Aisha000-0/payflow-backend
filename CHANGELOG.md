@@ -270,8 +270,34 @@ All notable changes to payflow-backend. The format follows
   `test/replay.test.ts` replays them through `decodeEvent` and the projection,
   asserts the resulting database state matches a committed snapshot, and proves
   that replaying the fixture twice leaves the database unchanged.
+- **Structured indexer progress every N ledgers (#359).** Each time the cursor
+  moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000; `0` turns it off)
+  the indexer logs one `indexer progress` line with the network, cursor,
+  latest ledger, how far behind it is, the ledgers and events since the last
+  line and the rate in ledgers per second, so a long catch-up shows movement
+  even through ranges with no events.
+- **The typed client reads charge attempts (#363).** The keeper already
+  records every attempt with its outcome and reason in `charge_attempts`
+  (#144); `PayflowClient.chargeAttempts` now reads them from
+  `GET /api/v1/mandates/:id/attempts`, and the route is listed in the README.
+- **A threat model for the public API (#360).** `docs/THREAT_MODEL.md`
+  describes the assets, actors and trust boundaries, every entry point with
+  how it authenticates, the merchant, SEP-10 and operator authorization
+  model, the controls in place, and fifteen known risks with the code they
+  live in and what contains them. It is linked from the README and
+  SECURITY.md.
 
 ### Changed
+
+- **The raw event feed reads one page per request (#364).** `GET /api/events`
+  without a `name` filter now asks the database for one page plus one row
+  (51) instead of a 200-row batch, and a `contract` filter is served by a new
+  `(contract_id, ledger, event_id)` index, created on startup for SQLite and
+  PostgreSQL alike, instead of walking every contract's events from the
+  cursor. On 200,000 events, a page for a contract with 50 of them went from a
+  91 ms parallel sequential scan to a 0.24 ms index scan on PostgreSQL 16, and
+  from 99 ms to 5 ms through the route on SQLite. Responses, page sizes and
+  cursors are unchanged.
 
 - **The indexer's idempotency is tested under random orderings (#48).** The
   projection was checked against a handful of hand-written replays. A seeded

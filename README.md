@@ -17,6 +17,7 @@
 > **Docs:** https://mmm-pay.github.io/payflow-docs/ ·
 > **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
 > **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md) ·
+> **Threat model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) ·
 > **API changelog:** [API_CHANGELOG.md](API_CHANGELOG.md)
 
 ---
@@ -93,6 +94,10 @@ events per page; `next` is `null` at the end. The ordering is ascending by
 `(ledger, event_id)`, which is stable across re-indexes and handles multiple
 events in the same ledger. Pass the unchanged `next` value as `after` for
 the next page. Invalid parameters return `400 invalid_request`.
+A page without `name` reads at most 51 rows, seeking from the cursor through
+the `(ledger, event_id)` index, or `(contract_id, ledger, event_id)` with
+`contract`, so its cost does not grow with the size of the table. `name` is
+matched on the decoded topic, so a filtered page scans in batches of 200.
 
 An event contains `contract`, `ledger`, `txHash`, `index`, `name`,
 `topics`, `data`, and `closeTime`. `topics` is an array of base64-encoded
@@ -224,6 +229,13 @@ in the builder, production dependencies only in the final image.
   applied in ledger order and the cursor advances only after a window is
   applied. Paging continues until a page is empty or passes the range end: a
   short page does not mean the range is exhausted.
+- **Catch-up progress is logged at a steady cadence.** Each time the cursor
+  moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000) the indexer logs
+  one `indexer progress` line with `network`, `cursor`, `latest`, `behind`,
+  the `ledgers` and `events` (and spec-`mismatched` events) since the last
+  line, and `ledgersPerSecond`. A long backfill shows movement even through
+  ranges with no events, and a caught-up indexer, which advances a few ledgers
+  per pass, stays quiet. `0` turns it off.
 - **Failing mandates back off.** A mandate whose charge fails (usually an
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
@@ -376,6 +388,7 @@ unversioned `/api/<network>/...` paths remain as aliases.
 | `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |
 | `GET` | `/api/mandates/:id` | One mandate |
 | `GET` | `/api/mandates/:id/charges?from=&to=` | Settlement history, optionally bounded by ledger close time |
+| `GET` | `/api/mandates/:id/attempts?limit=` | The keeper's charge attempts over the last 90 days, newest first: result (`settled`, `failed`, `skipped`), error code, tx hash, vault shortfall, failure streak and next retry |
 | `GET` | `/api/stream?merchant=&subscriber=` | Server-sent `charged`, `subscribed`, `cancelled` and `mandate_ended` events (25-second heartbeat) |
 | `POST` | `/api/webhooks` | Register a URL to receive signed `charged` events; proves control of the merchant address with a signature |
 | `POST` | `/api/webhooks/:id/rotate` | Replace a webhook's signing secret; both secrets sign during the overlap |
@@ -814,10 +827,11 @@ try {
 ```
 
 Every endpoint is covered: `health`, `plans`, `plan`, `planStats`, `mandates`,
-`mandate`, `charges`, `due`, `merchantSummary`, `merchantForecast`,
-`merchantSubscribers`, `merchantChurn`, `merchantRevenue`, `subscriberSummary`,
-`stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`. The client calls the
-versioned `/api/v1` paths; `health` stays at the service root.
+`mandate`, `charges`, `chargeAttempts`, `due`, `merchantSummary`,
+`merchantForecast`, `merchantSubscribers`, `merchantChurn`, `merchantRevenue`,
+`subscriberSummary`, `stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`.
+The client calls the versioned `/api/v1` paths; `health` stays at the service
+root.
 
 The client is published independently as
 [`@mmm-pay/payflow-client`](https://www.npmjs.com/package/@mmm-pay/payflow-client).
@@ -903,6 +917,7 @@ examined without API downtime.
 | `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
+| `INDEXER_PROGRESS_LEDGERS` | `10000` | Ledgers between two `indexer progress` log lines (cursor, lag, events, ledgers per second); `0` turns them off |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
 | `ARCHIVE_URL` | *(empty)* | Full-history archive URL used to backfill the gap between the stored cursor and the oldest ledger the RPC still serves |
@@ -1047,7 +1062,9 @@ Dependabot keeps dependencies current. Changes are recorded in
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Unaudited, testnet only.
+See [SECURITY.md](SECURITY.md). Unaudited, testnet only. The API's trust
+boundaries, authentication model and known risks are in
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 ## Maintainers
 
