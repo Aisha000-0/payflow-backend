@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import compression from "compression";
 import cors from "cors";
 import { rateLimit } from "express-rate-limit";
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
@@ -258,6 +259,18 @@ export function createApp(
 
   app.set("trust proxy", 1);
   app.use(helmet());
+  // Compress JSON/text responses to reduce payloads on mobile. SSE must remain
+  // unbuffered and is explicitly excluded.
+  app.use(
+    compression({
+      threshold: 1024,
+      filter: (req, res) => {
+        if (req.path === "/stream" || req.path.endsWith("/stream")) return false;
+        if (String(res.getHeader("Content-Type") ?? "").includes("text/event-stream")) return false;
+        return compression.filter(req, res);
+      },
+    }),
+  );
 
   // ReDoc runs its search index in a web worker created from a Blob URL.
   // Every other directive stays helmet's default: the bundle and the

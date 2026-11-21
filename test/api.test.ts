@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test, describe, before, after, mock } from "node:test";
-import type { Server } from "node:http";
+import http, { type Server } from "node:http";
+import { gunzipSync } from "node:zlib";
 import express, { type Express, type Request, type Response } from "express";
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp, errorHandler, loggableError } from "../src/app.ts";
@@ -824,10 +825,12 @@ describe("server-sent event stream", () => {
     try {
       const response = await fetch(`${streamBase}/api/stream?merchant=${MERCHANT}`, {
         signal: controller.signal,
+        headers: { "accept-encoding": "gzip" },
       });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
       assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("content-encoding"), null);
       assert.equal(streamIndexer.events.listenerCount("applied"), listenerCount + 1);
       const reader = response.body!.getReader();
       await reader.read();
@@ -855,6 +858,74 @@ describe("server-sent event stream", () => {
     } finally {
       streamServer.close();
       streamDb.close();
+    }
+  });
+});
+
+describe("response compression", () => {
+  test("compresses large JSON responses and reports size reduction", async () => {
+    const largeDb = openDatabase(":memory:");
+    const largeIx = new Indexer(largeDb, {} as never, {} as never);
+    for (let i = 1; i <= 40; i += 1) {
+      await largeIx.apply(ev("plan_created", [MERCHANT, BigInt(i)], {
+        token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: `plan-${i}-${"x".repeat(20)}`,
+      }, `plan-${i}`));
+    }
+    const app = createApp(largeDb, config);
+    const server = await new Promise<Server>((resolve) => {
+      const listening = app.listen(0, () => resolve(listening));
+    });
+    const port = (server.address() as { port: number }).port;
+    try {
+      const body = await new Promise<Buffer>((resolve, reject) => {
+        const req = http.request(
+          { hostname: "127.0.0.1", port, path: "/api/plans?limit=50", headers: { "accept-encoding": "gzip" } },
+          (res) => {
+            assert.equal(res.statusCode, 200);
+            assert.equal(res.headers["content-encoding"], "gzip");
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+            res.on("end", () => resolve(Buffer.concat(chunks)));
+            res.on("error", reject);
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      const decoded = gunzipSync(body).toString("utf8");
+      const payload = JSON.parse(decoded) as { plans: unknown[] };
+      assert.ok(payload.plans.length >= 40);
+      assert.ok(Buffer.byteLength(decoded) > 1024);
+      assert.ok(body.length < Buffer.byteLength(decoded), `compressed ${body.length} >= raw ${Buffer.byteLength(decoded)}`);
+    } finally {
+      server.close();
+      largeDb.close();
+    }
+  });
+
+  test("does not compress small responses below threshold", async () => {
+    const app = createApp(openDatabase(":memory:"), config);
+    const server = await new Promise<Server>((resolve) => {
+      const listening = app.listen(0, () => resolve(listening));
+    });
+    const port = (server.address() as { port: number }).port;
+    try {
+      const res = await new Promise<http.IncomingMessage>((resolve, reject) => {
+        const req = http.request(
+          { hostname: "127.0.0.1", port, path: "/api/stats", headers: { "accept-encoding": "gzip" } },
+          (response) => resolve(response),
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      const chunks: Buffer[] = [];
+      for await (const chunk of res) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const body = Buffer.concat(chunks);
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.headers["content-encoding"], undefined);
+      assert.ok(body.length < 1024);
+    } finally {
+      server.close();
     }
   });
 });
