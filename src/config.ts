@@ -222,6 +222,11 @@ const schema = z.object({
     .optional()
     .transform((value) => (value === "" ? undefined : value)),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  REDIS_URL: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || isHttpUrl(value) || value.startsWith("redis://") || value.startsWith("rediss://"), "must be a redis(s) URL"),
 
   ADMIN_TOKEN: z.string().optional(),
   /**

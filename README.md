@@ -34,6 +34,10 @@ what this service is for. It does three jobs:
 | **Keeper** | Finds mandates that have fallen due and calls `charge` on-chain |
 | **API** | Serves the projection to the frontend over REST |
 
+### Cache
+
+Merchant summaries and token metadata are cached to reduce repeated projection and RPC work. Without `REDIS_URL`, the service uses a bounded in-memory cache per process. When `REDIS_URL` is set, it uses Redis so multiple API instances can share cache entries. Indexer event application and reconcile repairs invalidate affected merchant summary keys.
+
 ### The keeper is not a trust dependency
 
 `charge` is permissionless on-chain. This keeper holds no user funds and has no
@@ -925,6 +929,7 @@ examined without API downtime.
 | `ALLOW_GAPS` | `false` | Advance the cursor past a gap the RPC cannot serve, accepting lost history; without it the indexer refuses to advance past a gap |
 | `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
 | `DATABASE_URL` | — | `postgres://` or `postgresql://` connection string; when set, PostgreSQL is used instead of SQLite |
+| `REDIS_URL` | — | Optional `redis://`/`rediss://` shared cache for merchant summaries and token metadata; defaults to in-memory cache |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |

@@ -39,54 +39,46 @@ import {
   validate,
 } from "./validate.ts";
 
+import type { CacheStore } from "../lib/cache.ts";
+import { MemoryCache } from "../lib/cache.ts";
+
 /**
- * Bounded LRU in-memory cache for merchant summaries.
- * Keeps memory bounded under high merchant concurrency while allowing
- * instant invalidation when the indexer applies an event for a merchant.
+ * Cache for merchant summary responses. Defaults to a bounded in-memory LRU;
+ * a Redis-backed CacheStore can be injected for multi-instance deployments.
  */
 export class MerchantSummaryCache {
-  private readonly max: number;
-  private readonly map = new Map<string, MerchantSummary>();
+  private readonly store: CacheStore<MerchantSummary>;
+  readonly memory: MemoryCache<MerchantSummary> | undefined;
 
-  constructor(max = 1_000) {
-    this.max = max;
-  }
-
-  get(merchant: string): MerchantSummary | undefined {
-    const entry = this.map.get(merchant);
-    if (entry !== undefined) {
-      this.map.delete(merchant);
-      this.map.set(merchant, entry);
-    }
-    return entry;
-  }
-
-  set(merchant: string, summary: MerchantSummary): void {
-    if (this.map.has(merchant)) {
-      this.map.delete(merchant);
-    } else if (this.map.size >= this.max) {
-      const oldest = this.map.keys().next().value;
-      if (oldest !== undefined) {
-        this.map.delete(oldest);
-      }
-    }
-    this.map.set(merchant, summary);
-  }
-
-  invalidate(merchant: string): void {
-    for (const key of [...this.map.keys()]) {
-      if (key === merchant || key.startsWith(`${merchant}:`)) {
-        this.map.delete(key);
-      }
+  constructor(store?: CacheStore<MerchantSummary> | number) {
+    if (typeof store === "number" || store === undefined) {
+      const mem = new MemoryCache<MerchantSummary>(typeof store === "number" ? store : 1_000);
+      this.store = mem;
+      this.memory = mem;
+    } else {
+      this.store = store;
+      this.memory = store instanceof MemoryCache ? store : undefined;
     }
   }
 
-  clear(): void {
-    this.map.clear();
+  async get(merchant: string): Promise<MerchantSummary | undefined> {
+    return this.store.get(merchant);
+  }
+
+  async set(merchant: string, summary: MerchantSummary, ttlMs?: number): Promise<void> {
+    await this.store.set(merchant, summary, ttlMs);
+  }
+
+  async invalidate(merchant: string): Promise<void> {
+    await this.store.delete(merchant);
+  }
+
+  async clear(): Promise<void> {
+    await this.store.clear();
   }
 
   get size(): number {
-    return this.map.size;
+    return this.memory?.size ?? 0;
   }
 }
 
@@ -152,14 +144,14 @@ export function merchantsRouter(
     if (!address.ok) return;
 
     const cacheKey = defaultToken ? `${address.value}:${defaultToken}` : address.value;
-    const cached = cache.get(cacheKey);
+    const cached = await cache.get(cacheKey);
     if (cached !== undefined) {
       res.json(cached);
       return;
     }
 
-  const body = await getMerchantSummary(db, address.value, defaultToken);
-    cache.set(cacheKey, body);
+    const body = await getMerchantSummary(db, address.value, defaultToken);
+    await cache.set(cacheKey, body);
     res.json(body);
   });
 

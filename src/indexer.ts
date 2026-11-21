@@ -722,7 +722,7 @@ export class Indexer {
 
   private async onPlanCreated(e: DecodedEvent, storage: Storage): Promise<void> {
     const [merchant, planId] = e.topics;
-    this.merchantCache.invalidate(str(merchant));
+    await this.merchantCache.invalidate(str(merchant));
     await storage.run(
       `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
          VALUES (?, ?, ?, ?, ?, ?, 1, ?)
@@ -783,7 +783,7 @@ export class Indexer {
 
   private async onSubscribed(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId, subscriber, merchant] = e.topics;
-    this.merchantCache.invalidate(str(merchant));
+    await this.merchantCache.invalidate(str(merchant));
     await storage.run(
       `INSERT INTO mandates
            (id, subscriber, merchant, plan_id, amount, period, next_charge,
@@ -825,7 +825,7 @@ export class Indexer {
   private async onCharged(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId, subscriber, merchant] = e.topics;
     const id = num(mandateId);
-    this.merchantCache.invalidate(str(merchant));
+    await this.merchantCache.invalidate(str(merchant));
 
     await storage.run(
       `INSERT INTO charges
@@ -880,7 +880,7 @@ export class Indexer {
       "SELECT merchant FROM mandates WHERE id = ?",
       [mid],
     );
-    if (row) this.merchantCache.invalidate(row.merchant);
+    if (row) await this.merchantCache.invalidate(row.merchant);
     await storage.run("UPDATE mandates SET status = ?, ended_by = ? WHERE id = ?", [status, endedBy, mid]);
     return row?.merchant;
   }
@@ -932,7 +932,7 @@ export class Indexer {
       "SELECT merchant FROM mandates WHERE id = ?",
       [mid],
     );
-    if (row) this.merchantCache.invalidate(row.merchant);
+    if (row) await this.merchantCache.invalidate(row.merchant);
     await storage.run(
       `UPDATE mandates SET status = ?
           WHERE id = ? AND status IN ('Active','Paused')`,

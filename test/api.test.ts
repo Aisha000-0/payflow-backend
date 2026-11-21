@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test, describe, before, after, mock } from "node:test";
-import type { Server } from "node:http";
+import http, { type Server } from "node:http";
+import { gunzipSync } from "node:zlib";
 import express, { type Express, type Request, type Response } from "express";
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp, errorHandler, loggableError } from "../src/app.ts";
@@ -775,19 +776,19 @@ describe("merchant summary caching", () => {
       tokens: [],
     });
 
-    cache.set("m1", mockSummary("m1"));
-    cache.set("m2", mockSummary("m2"));
+    await cache.set("m1", mockSummary("m1"));
+    await cache.set("m2", mockSummary("m2"));
     assert.equal(cache.size, 2);
 
     // Access m1 so m2 is the least recently used
-    assert.equal(cache.get("m1")?.merchant, "m1");
+    assert.equal((await cache.get("m1"))?.merchant, "m1");
 
     // Inserting 3rd entry evicts m2
-    cache.set("m3", mockSummary("m3"));
+    await cache.set("m3", mockSummary("m3"));
     assert.equal(cache.size, 2);
-    assert.equal(cache.get("m1")?.merchant, "m1");
-    assert.equal(cache.get("m2"), undefined);
-    assert.equal(cache.get("m3")?.merchant, "m3");
+    assert.equal((await cache.get("m1"))?.merchant, "m1");
+    assert.equal(await cache.get("m2"), undefined);
+    assert.equal((await cache.get("m3"))?.merchant, "m3");
   });
 });
 
@@ -824,10 +825,12 @@ describe("server-sent event stream", () => {
     try {
       const response = await fetch(`${streamBase}/api/stream?merchant=${MERCHANT}`, {
         signal: controller.signal,
+        headers: { "accept-encoding": "gzip" },
       });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
       assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("content-encoding"), null);
       assert.equal(streamIndexer.events.listenerCount("applied"), listenerCount + 1);
       const reader = response.body!.getReader();
       await reader.read();
@@ -855,6 +858,74 @@ describe("server-sent event stream", () => {
     } finally {
       streamServer.close();
       streamDb.close();
+    }
+  });
+});
+
+describe("response compression", () => {
+  test("compresses large JSON responses and reports size reduction", async () => {
+    const largeDb = openDatabase(":memory:");
+    const largeIx = new Indexer(largeDb, {} as never, {} as never);
+    for (let i = 1; i <= 40; i += 1) {
+      await largeIx.apply(ev("plan_created", [MERCHANT, BigInt(i)], {
+        token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: `plan-${i}-${"x".repeat(20)}`,
+      }, `plan-${i}`));
+    }
+    const app = createApp(largeDb, config);
+    const server = await new Promise<Server>((resolve) => {
+      const listening = app.listen(0, () => resolve(listening));
+    });
+    const port = (server.address() as { port: number }).port;
+    try {
+      const body = await new Promise<Buffer>((resolve, reject) => {
+        const req = http.request(
+          { hostname: "127.0.0.1", port, path: "/api/plans?limit=50", headers: { "accept-encoding": "gzip" } },
+          (res) => {
+            assert.equal(res.statusCode, 200);
+            assert.equal(res.headers["content-encoding"], "gzip");
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+            res.on("end", () => resolve(Buffer.concat(chunks)));
+            res.on("error", reject);
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      const decoded = gunzipSync(body).toString("utf8");
+      const payload = JSON.parse(decoded) as { plans: unknown[] };
+      assert.ok(payload.plans.length >= 40);
+      assert.ok(Buffer.byteLength(decoded) > 1024);
+      assert.ok(body.length < Buffer.byteLength(decoded), `compressed ${body.length} >= raw ${Buffer.byteLength(decoded)}`);
+    } finally {
+      server.close();
+      largeDb.close();
+    }
+  });
+
+  test("does not compress small responses below threshold", async () => {
+    const app = createApp(openDatabase(":memory:"), config);
+    const server = await new Promise<Server>((resolve) => {
+      const listening = app.listen(0, () => resolve(listening));
+    });
+    const port = (server.address() as { port: number }).port;
+    try {
+      const res = await new Promise<http.IncomingMessage>((resolve, reject) => {
+        const req = http.request(
+          { hostname: "127.0.0.1", port, path: "/api/stats", headers: { "accept-encoding": "gzip" } },
+          (response) => resolve(response),
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      const chunks: Buffer[] = [];
+      for await (const chunk of res) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const body = Buffer.concat(chunks);
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.headers["content-encoding"], undefined);
+      assert.ok(body.length < 1024);
+    } finally {
+      server.close();
     }
   });
 });
@@ -1583,22 +1654,22 @@ describe("merchant churn", () => {
   };
 
   before(async () => {
-    churnIx.apply(ev("plan_created", [CHURN_MERCHANT, 1n], {
+    await churnIx.apply(ev("plan_created", [CHURN_MERCHANT, 1n], {
       token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
     }, "tx-plan", JAN_END));
 
     // Mandate 1 starts in January and is cancelled in February.
-    churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+    await churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }, "tx-sub-1", JAN_END));
-    churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
+    await churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
 
     // Mandate 2 starts in February and is ended by the merchant, also in
     // February.
-    churnIx.apply(ev("subscribed", [2n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+    await churnIx.apply(ev("subscribed", [2n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }, "tx-sub-2", FEB_MID));
-    churnIx.apply(ev("mandate_ended", [2n, CHURN_MERCHANT], {
+    await churnIx.apply(ev("mandate_ended", [2n, CHURN_MERCHANT], {
       subscriber: CHURN_SUBSCRIBER, charges_made: 1,
     }, "tx-end-2", FEB_MID));
 

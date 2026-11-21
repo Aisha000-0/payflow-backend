@@ -22,6 +22,7 @@ import {
 import type { TokenMetadata } from "../routes/types.ts";
 import { logger } from "./logger.ts";
 import { simulationSource } from "./simulate.ts";
+import type { CacheStore } from "./cache.ts";
 
 /** Stroops per lumien: fixed by the protocol, never read from the network. */
 export const NATIVE_DECIMALS = 7;
@@ -161,6 +162,8 @@ export interface TokenCacheOptions {
    * plain `native` alias is.
    */
   networkPassphrase?: string;
+  /** Optional shared cache (e.g. Redis) for multi-instance deployments. */
+  store?: CacheStore<TokenMetadata>;
 }
 
 interface CacheEntry {
@@ -183,6 +186,7 @@ export class TokenMetadataService {
   private readonly max: number;
   private readonly now: () => number;
   private readonly networkPassphrase: string | undefined;
+  private readonly store: CacheStore<TokenMetadata> | undefined;
   /** Resolved entries, oldest first so the front is the least recently used. */
   private readonly entries = new Map<string, CacheEntry>();
   /** Reads in flight, so concurrent lookups of one token share an RPC call. */
@@ -194,6 +198,7 @@ export class TokenMetadataService {
     this.max = options.max ?? 256;
     this.now = options.now ?? (() => Date.now());
     this.networkPassphrase = options.networkPassphrase;
+    this.store = options.store;
   }
 
   /**
@@ -228,22 +233,31 @@ export class TokenMetadataService {
   clear(): void {
     this.entries.clear();
     this.pending.clear();
+    void this.store?.clear();
   }
 
   /** Reads metadata, throwing `TokenMetadataUnavailable` when it cannot be had. */
-  fetch(tokenId: string): Promise<TokenMetadata> {
+  async fetch(tokenId: string): Promise<TokenMetadata> {
     const native = this.nativeFor(tokenId);
-    if (native) return Promise.resolve(native);
+    if (native) return native;
 
     const hit = this.cached(tokenId);
-    if (hit) return Promise.resolve(hit);
+    if (hit) return hit;
+    if (this.store) {
+      const stored = await this.store.get(tokenId);
+      if (stored) {
+        this.remember(tokenId, stored);
+        return stored;
+      }
+    }
 
     const inFlight = this.pending.get(tokenId);
     if (inFlight) return inFlight;
 
     const read = this.reader(tokenId)
-      .then((value) => {
+      .then(async (value) => {
         this.remember(tokenId, value);
+        if (this.store) await this.store.set(tokenId, value, this.ttlMs);
         return value;
       })
       .finally(() => {
@@ -263,6 +277,15 @@ export class TokenMetadataService {
       logger.warn({ token: tokenId, err }, "token metadata unavailable");
       return null;
     }
+  }
+
+  async invalidate(tokenId?: string): Promise<void> {
+    if (!tokenId) {
+      this.clear();
+      return;
+    }
+    this.entries.delete(tokenId);
+    await this.store?.delete(tokenId);
   }
 
   private remember(tokenId: string, value: TokenMetadata): void {
