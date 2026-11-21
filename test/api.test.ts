@@ -775,19 +775,19 @@ describe("merchant summary caching", () => {
       tokens: [],
     });
 
-    cache.set("m1", mockSummary("m1"));
-    cache.set("m2", mockSummary("m2"));
+    await cache.set("m1", mockSummary("m1"));
+    await cache.set("m2", mockSummary("m2"));
     assert.equal(cache.size, 2);
 
     // Access m1 so m2 is the least recently used
-    assert.equal(cache.get("m1")?.merchant, "m1");
+    assert.equal((await cache.get("m1"))?.merchant, "m1");
 
     // Inserting 3rd entry evicts m2
-    cache.set("m3", mockSummary("m3"));
+    await cache.set("m3", mockSummary("m3"));
     assert.equal(cache.size, 2);
-    assert.equal(cache.get("m1")?.merchant, "m1");
-    assert.equal(cache.get("m2"), undefined);
-    assert.equal(cache.get("m3")?.merchant, "m3");
+    assert.equal((await cache.get("m1"))?.merchant, "m1");
+    assert.equal(await cache.get("m2"), undefined);
+    assert.equal((await cache.get("m3"))?.merchant, "m3");
   });
 });
 
@@ -1583,22 +1583,22 @@ describe("merchant churn", () => {
   };
 
   before(async () => {
-    churnIx.apply(ev("plan_created", [CHURN_MERCHANT, 1n], {
+    await churnIx.apply(ev("plan_created", [CHURN_MERCHANT, 1n], {
       token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
     }, "tx-plan", JAN_END));
 
     // Mandate 1 starts in January and is cancelled in February.
-    churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+    await churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }, "tx-sub-1", JAN_END));
-    churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
+    await churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
 
     // Mandate 2 starts in February and is ended by the merchant, also in
     // February.
-    churnIx.apply(ev("subscribed", [2n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+    await churnIx.apply(ev("subscribed", [2n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }, "tx-sub-2", FEB_MID));
-    churnIx.apply(ev("mandate_ended", [2n, CHURN_MERCHANT], {
+    await churnIx.apply(ev("mandate_ended", [2n, CHURN_MERCHANT], {
       subscriber: CHURN_SUBSCRIBER, charges_made: 1,
     }, "tx-end-2", FEB_MID));
 

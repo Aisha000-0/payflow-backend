@@ -9,6 +9,10 @@ import { WebhookDispatcher } from "./lib/webhooks.ts";
 import { sep10For } from "./routes/auth.ts";
 import { createApp } from "./app.ts";
 import { Indexer } from "./indexer.ts";
+import { createCache } from "./lib/cache.ts";
+import { MerchantSummaryCache } from "./routes/merchants.ts";
+import type { TokenMetadata } from "./routes/types.ts";
+import type { MerchantSummary } from "./routes/types.ts";
 import { Keeper } from "./keeper.ts";
 import type { AdminHooks } from "./routes/admin.ts";
 import { logger } from "./lib/logger.ts";
@@ -43,7 +47,11 @@ const runtimes = await Promise.all(networks.map(async (network) => {
   // the oldest ledger the RPC still serves, so an outage longer than RPC
   // retention does not silently shrink the projection.
   const archive = network.archiveUrl ? new HttpArchive(network.archiveUrl) : undefined;
-  const indexer = new Indexer(db, server, network, undefined, archive);
+  const summaryCache = new MerchantSummaryCache(
+    createCache<MerchantSummary>(config.REDIS_URL, `payflow:${network.name}:merchant-summary`),
+  );
+  const tokenCache = createCache<TokenMetadata>(config.REDIS_URL, `payflow:${network.name}:token`);
+  const indexer = new Indexer(db, server, network, summaryCache, archive);
   const dispatcher = new WebhookDispatcher({
     db,
     events: indexer.events,
@@ -69,7 +77,7 @@ const runtimes = await Promise.all(networks.map(async (network) => {
   // RPC failover the indexer uses, cached by contract id (see lib/tokens.ts).
   const tokens = new TokenMetadataService(
     makeSimulationReader(server, network.networkPassphrase),
-    { networkPassphrase: network.networkPassphrase },
+    { networkPassphrase: network.networkPassphrase, store: tokenCache },
   );
   // Re-reads a sample of active mandates from the contract and repairs any
   // drift the indexer missed (RPC gap, bug, outage mid-range).
@@ -81,11 +89,11 @@ const runtimes = await Promise.all(networks.map(async (network) => {
     config.RECONCILE_SAMPLE_SIZE,
     // A repaired mandate changes the merchant's summary; evict it so the API
     // serves the corrected projection instead of a stale cache entry.
-    (merchant) => indexer.merchantCache.invalidate(merchant),
+    (merchant) => { void indexer.merchantCache.invalidate(merchant); },
   );
   // SEP-10 sign-in reads the signing account's signers through the same RPC.
   const auth = sep10For(config, network, server);
-  return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth };
+  return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth, summaryCache, tokenCache };
 }));
 const defaultRuntime = runtimes[0]!;
 // Release the database locks however the process ends; a crash that skips
@@ -238,7 +246,7 @@ if (runApi) {
       db: rt.db,
       events: rt.indexer.events,
       indexer: rt.indexer.status,
-      summaryCache: rt.indexer.merchantCache,
+      summaryCache: rt.summaryCache,
       rpc: rt.server,
       tokens: rt.tokens,
       webhooks: rt.dispatcher,
@@ -362,6 +370,10 @@ async function shutdown(signal: string): Promise<void> {
   const closeAll = async () => {
     await Promise.all(
       runtimes.map(async (rt) => {
+        await rt.summaryCache.clear().catch(() => undefined);
+        await rt.tokenCache.close().catch(() => undefined);
+        const summaryStore = (rt.summaryCache as unknown as { store?: { close?: () => Promise<void> } }).store;
+        await summaryStore?.close?.().catch(() => undefined);
         await rt.db.close();
         rt.releaseLock?.();
       }),
