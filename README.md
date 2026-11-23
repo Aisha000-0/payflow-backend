@@ -515,6 +515,43 @@ string the projection computed, in the token's smallest unit — an amount
 never becomes a JavaScript number. The counters are the process's own totals:
 they reset when the process restarts, which is what Prometheus expects.
 
+#### Grafana dashboard
+
+[`deploy/grafana/payflow.json`](deploy/grafana/payflow.json) is a Grafana 11
+dashboard for the metrics above, so turning metrics on does not also mean
+building the dashboard from scratch.
+
+To import it:
+
+1. Enable `METRICS_ENABLED=true`, point Prometheus at the service's `/metrics`
+   endpoint, and add that Prometheus to Grafana as a data source.
+2. In Grafana, open **Dashboards → New → Import**, upload
+   `deploy/grafana/payflow.json`, and pick the Prometheus data source when
+   Grafana asks for it.
+3. Select **Import**. The dashboard's `Network` variable filters every panel
+   and defaults to all networks, so one dashboard covers a single-network and a
+   multi-network deployment.
+
+The dashboard is deliberately small; each row answers one operator question.
+
+| Row | What it shows |
+|---|---|
+| Overview | Indexer lag, indexed ledger, keeper success rate, active mandates, active merchants and MRR at a glance |
+| Indexer | Lag over time, the projected cursor against the latest ledger, and events applied per second |
+| Keeper | Passes, settled and failed charges per second, the keeper failure ratio, and the process's settled/failed/pass totals |
+| Webhooks | Delivery attempts by result (delivered/failed), failed deliveries per second, and the delivery success rate |
+| HTTP requests | p50/p95/p99 request latency per route, requests per second by status, and the 5xx error ratio |
+| Business | Active mandates, active merchants and MRR per network |
+
+The dashboard is the reference consumer for the business gauges added by #166
+(`payflow_active_mandates`, `payflow_active_merchants`, `payflow_mrr`) and for
+the HTTP histogram added by #286
+(`payflow_http_request_duration_seconds{route,status}`); the webhook row reads
+`payflow_webhook_deliveries_total{result}`. Those panels stay empty until the
+corresponding instrumentation is deployed, and the rest of the dashboard works
+with the metrics in the table above. Shipping the queries now means neither
+instrumentation needs a follow-up dashboard change.
+
 ### The due list and the vault balance
 
 `GET /api/due` lists the mandates that can be charged right now. Each one
