@@ -450,6 +450,19 @@ The three indexer gauges carry a `network` label, so an instance that serves
 testnet and mainnet reports both. The counters are the process's own totals:
 they reset when the process restarts, which is what Prometheus expects.
 
+#### Alert rules
+
+[`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml) holds
+Prometheus alert rules for indexer lag, keeper failures and low keeper
+balance, webhook delivery failures and 5xx response rates. Each rule
+states its threshold and why it is that value at the top of the file; point
+Prometheus's `rule_files` at it. CI runs `promtool check rules` over it.
+
+The keeper-balance, webhook-delivery and request-duration series are still
+to be instrumented, so those three rules stay inert until the corresponding
+metrics are exported; the indexer and keeper-failure rules use the metrics in
+the table above.
+
 ### The due list and the vault balance
 
 `GET /api/due` lists the mandates that can be charged right now. Each one
