@@ -1,16 +1,31 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
+import type { Storage } from "../lib/store/types.ts";
 import {
+  getSubscriberExport,
   getSubscriberSummary,
+  listSubscriberChargesAfter,
   listSubscriberUpcomingMandates,
+  type ChargeKey,
 } from "../lib/queries.ts";
-import { addressSchema, daysSchema, present, validate } from "./validate.ts";
+import {
+  addressSchema,
+  daysSchema,
+  present,
+  unixSecondsSchema,
+  validate,
+} from "./validate.ts";
+import { tokenUnits } from "./merchants.ts";
 import type { UpcomingCharge, UpcomingChargesResponse } from "./types.ts";
+import { sendApiError } from "./errors.ts";
+import { sessionOf, type Sep10Auth } from "./auth.ts";
 
 const DAY_S = 86_400;
 const DEFAULT_FORECAST_DAYS = 30;
 const MAX_FORECAST_DAYS = 365;
 const MAX_UPCOMING_PER_MANDATE = 400;
+/** Rows read per query while streaming the charges CSV. */
+const CSV_PAGE = 500;
+const CSV_HEADER = "date,merchant,plan,amount,fee,tx_hash";
 
 function daysOf(raw: unknown, fallback = DEFAULT_FORECAST_DAYS): number {
   const n = Number(raw);
@@ -18,16 +33,83 @@ function daysOf(raw: unknown, fallback = DEFAULT_FORECAST_DAYS): number {
   return Math.min(Math.trunc(n), MAX_FORECAST_DAYS);
 }
 
-/** `GET /subscribers/:address/summary` and `GET /subscribers/:address/upcoming`. */
-export function subscribersRouter(db: DatabaseSync): Router {
+/** `GET /subscribers/:address/summary`, `GET /subscribers/:address/upcoming`, and `GET /subscribers/:address/export`. */
+export function subscribersRouter(db: Storage, auth?: Sep10Auth): Router {
   const r = Router();
 
-  r.get("/subscribers/:address/summary", (req, res) => {
+  r.get("/subscribers/:address/summary", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
 
-    const body = getSubscriberSummary(db, address.value);
+    const body = await getSubscriberSummary(db, address.value);
     res.json(body);
+  });
+
+  /**
+   * `GET /subscribers/:address/charges.csv?from=&to=`: every settled charge
+   * paid by the subscriber, oldest first, as a CSV download for accounting.
+   *
+   * `amount` is what the subscriber paid (the charge amount plus the fee),
+   * `fee` the protocol's share, each in token units with seven decimals and
+   * computed as bigint. `plan` is the mandate's plan id. `date` is the
+   * charge's ledger close time in ISO 8601 UTC. Rows are streamed a page at a
+   * time, so neither the response nor a single query grows with the history.
+   */
+  r.get("/subscribers/:address/charges.csv", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+    const from = validate(req, res, "from", unixSecondsSchema.optional(), present(req.query.from));
+    if (!from.ok) return;
+    const to = validate(req, res, "to", unixSecondsSchema.optional(), present(req.query.to));
+    if (!to.ok) return;
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="payflow-charges-${address.value}.csv"`,
+    );
+    res.write(`${CSV_HEADER}\r\n`);
+
+    let after: ChargeKey | null = null;
+    for (;;) {
+      const rows = await listSubscriberChargesAfter(
+        db,
+        address.value,
+        after,
+        CSV_PAGE,
+        from.value === undefined ? undefined : from.value * 1000,
+        to.value === undefined ? undefined : to.value * 1000,
+      );
+      if (rows.length === 0) break;
+      let chunk = "";
+      for (const row of rows) {
+        const fee = BigInt(row.fee);
+        chunk += [
+          new Date(row.created_at).toISOString(),
+          row.merchant,
+          row.plan_id ?? "",
+          tokenUnits(BigInt(row.amount) + fee),
+          tokenUnits(fee),
+          row.tx_hash,
+        ].join(",") + "\r\n";
+      }
+      // Respect backpressure from a slow client, and stop if it went away.
+      if (!res.write(chunk)) {
+        await new Promise<void>((resolve) => {
+          const done = (): void => {
+            res.off("drain", done);
+            res.off("close", done);
+            resolve();
+          };
+          res.on("drain", done);
+          res.on("close", done);
+        });
+      }
+      if (res.destroyed) return;
+      if (rows.length < CSV_PAGE) break;
+      after = rows[rows.length - 1]!;
+    }
+    res.end();
   });
 
   /**
@@ -41,7 +123,7 @@ export function subscribersRouter(db: DatabaseSync): Router {
    * `now + period` rather than walking the ones it skipped. Subsequent
    * occurrences step by `period` while they stay inside `[now, until)`.
    */
-  r.get("/subscribers/:address/upcoming", (req, res) => {
+  r.get("/subscribers/:address/upcoming", async (req, res) => {
     const address = validate(req, res, "address", addressSchema, req.params.address);
     if (!address.ok) return;
     const days = validate(req, res, "days", daysSchema.optional(), present(req.query.days));
@@ -51,8 +133,8 @@ export function subscribersRouter(db: DatabaseSync): Router {
     const window = daysOf(days.value);
     const now = Math.floor(Date.now() / 1000);
     const until = now + window * DAY_S;
+    const mandates = await listSubscriberUpcomingMandates(db, subscriber);
 
-    const mandates = listSubscriberUpcomingMandates(db, subscriber);
 
     const upcoming: UpcomingCharge[] = [];
     let truncated = false;
@@ -97,6 +179,44 @@ export function subscribersRouter(db: DatabaseSync): Router {
         "Vault funding is not modelled; an underfunded vault will not settle on schedule.",
       ],
     };
+    res.json(body);
+  });
+
+  /**
+   * `GET /subscribers/:address/export`: everything the backend holds about a
+   * subscriber, in one JSON response suitable for a GDPR data-access request.
+   *
+   * The subscriber must authenticate: a valid SEP-10 JWT is required, and its
+   * subject must equal the `:address` path parameter. A missing or expired
+   * token is answered with 401; a token for a different account is answered
+   * with 403.
+   *
+   * The response is a JSON file download (`Content-Disposition: attachment`)
+   * so it can be saved directly by a browser. It contains mandates, settled
+   * charges, keeper attempts, total paid, and the timestamp at which the
+   * export was generated.
+   */
+  r.get("/subscribers/:address/export", async (req, res) => {
+    const address = validate(req, res, "address", addressSchema, req.params.address);
+    if (!address.ok) return;
+
+    const session = sessionOf(req, res, auth);
+    if (!session.ok) return;
+    if (session.value === null) {
+      sendApiError(res, req, 401, "unauthorized", "A SEP-10 bearer token is required to export subscriber data.");
+      return;
+    }
+    if (session.value !== address.value) {
+      sendApiError(res, req, 403, "forbidden", "You may only export your own data.");
+      return;
+    }
+
+    const body = await getSubscriberExport(db, address.value);
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="payflow-export-${address.value}.json"`,
+    );
     res.json(body);
   });
 

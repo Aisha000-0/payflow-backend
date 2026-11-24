@@ -1,6 +1,12 @@
 import { createHmac, randomUUID } from "node:crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { isIP, type LookupFunction } from "node:net";
 import type { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
+import { asStorage } from "./store/index.ts";
+import type { Storage } from "./store/types.ts";
 import { big, num, str } from "./stellar.ts";
 import type { DecodedEvent } from "./stellar.ts";
 import type {
@@ -24,6 +30,130 @@ const RETRY_BATCH = 25;
 const HISTORY_LIMIT = 100;
 /** How long a rotated secret keeps signing when no overlap is configured. */
 const DEFAULT_SECRET_OVERLAP_S = 24 * 60 * 60;
+
+export interface WebhookAddress {
+  address: string;
+  family: 4 | 6;
+}
+
+export type WebhookLookup = (hostname: string) => Promise<WebhookAddress[]>;
+
+const systemLookup: WebhookLookup = async (hostname) => {
+  const addresses = await dnsLookup(hostname, { all: true, verbatim: true });
+  return addresses.flatMap(({ address, family }) =>
+    family === 4 || family === 6 ? [{ address, family }] : [],
+  );
+};
+
+function ipValue(address: string): { family: 4 | 6; value: bigint } | null {
+  const family = isIP(address);
+  if (family === 4) {
+    const value = address.split(".").reduce((result, part) => (result << 8n) | BigInt(part), 0n);
+    return { family: 4, value };
+  }
+  if (family !== 6) return null;
+
+  const normalized = address.toLowerCase();
+  const halves = normalized.split("::");
+  if (halves.length > 2) return null;
+  const expand = (half: string): string[] => half === "" ? [] : half.split(":");
+  const left = expand(halves[0]!);
+  const right = expand(halves[1] ?? "");
+  const missing = 8 - left.length - right.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0)) return null;
+  const groups = [...left, ...Array.from({ length: missing }, () => "0"), ...right];
+  if (groups.length !== 8 || groups.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return null;
+  const value = groups.reduce((result, group) => (result << 16n) | BigInt(`0x${group}`), 0n);
+  return { family: 6, value };
+}
+
+function inCidr(value: bigint, network: bigint, bits: number, prefix: number): boolean {
+  const mask = ((1n << BigInt(prefix)) - 1n) << BigInt(bits - prefix);
+  return (value & mask) === network;
+}
+
+const IPV4_BLOCKED = [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8],
+  ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24],
+  ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["198.51.100.0", 24],
+  ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
+] as const;
+
+function isPublicAddress(address: WebhookAddress): boolean {
+  const parsed = ipValue(address.address);
+  if (!parsed || parsed.family !== address.family) return false;
+  if (parsed.family === 4) {
+    return !IPV4_BLOCKED.some(([network, prefix]) => {
+      const parsedNetwork = ipValue(network)!;
+      return inCidr(parsed.value, parsedNetwork.value, 32, prefix);
+    });
+  }
+
+  // Only global unicast IPv6 is accepted. This excludes loopback, link-local,
+  // unique-local, multicast, unspecified, and IPv4-mapped addresses.
+  if (!inCidr(parsed.value, 0x20000000000000000000000000000000n, 128, 3)) return false;
+  const blocked = [
+    [0x20010db8000000000000000000000000n, 32], // documentation
+    [0x20010000000000000000000000000000n, 23], // IETF protocol assignments
+    [0x20020000000000000000000000000000n, 16], // 6to4 embeds IPv4
+  ] as const;
+  return !blocked.some(([network, prefix]) => inCidr(parsed.value, network, 128, prefix));
+}
+
+async function resolvePublicTarget(rawUrl: string, lookupImpl: WebhookLookup): Promise<{
+  url: URL;
+  addresses: WebhookAddress[];
+}> {
+  const url = new URL(rawUrl);
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+    throw new Error("webhook URL must be an http(s) URL without credentials");
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, "");
+  const literalFamily = isIP(hostname);
+  const addresses = literalFamily
+    ? [{ address: hostname, family: literalFamily as 4 | 6 }]
+    : await lookupImpl(hostname);
+  if (addresses.length === 0 || addresses.some((address) => !isPublicAddress(address))) {
+    throw new Error("webhook URL must resolve only to public addresses");
+  }
+  return { url, addresses };
+}
+
+function postToPinnedAddress(
+  url: URL,
+  addresses: WebhookAddress[],
+  init: RequestInit,
+): Promise<FetchResponse> {
+  const first = addresses[0]!;
+  const lookup: LookupFunction = (_hostname, options, callback) => {
+    if (typeof options === "object" && options.all) {
+      callback(null, addresses);
+    } else {
+      callback(null, first.address, first.family);
+    }
+  };
+  const headers = Object.fromEntries(new Headers(init.headers).entries());
+  const request = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, {
+    method: init.method,
+    headers,
+    lookup,
+    signal: init.signal ?? undefined,
+  });
+
+  return new Promise((resolve, reject) => {
+    request.on("error", reject);
+    request.on("response", (response) => {
+      const status = response.statusCode ?? 0;
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => { body += chunk; });
+      response.on("error", reject);
+      response.on("end", () => resolve({ status, ok: status >= 200 && status < 300, text: async () => body }));
+    });
+    if (typeof init.body === "string") request.write(init.body);
+    request.end();
+  });
+}
 
 function backoffSeconds(attempt: number): number {
   return Math.min(BACKOFF_BASE_S * 2 ** (attempt - 1), BACKOFF_MAX_S);
@@ -97,16 +227,50 @@ function signatureHeader(payload: string, webhook: WebhookRow, now: number): str
     .join(", ");
 }
 
+/** What every keeper streak event says about the mandate it is about. */
+interface ChargeStreakBase {
+  mandateId: number;
+  subscriber: string;
+  merchant: string;
+  /** Consecutive failed attempts: the streak so far, or the one that just ended. */
+  failures: number;
+  /** The `charge_attempts` row that changed the streak; names the event. */
+  attemptId: number;
+}
+
+/**
+ * A change in a mandate's run of failed charges, as the keeper reports it
+ * (#145): `charge.failing` when the streak reaches its threshold,
+ * `charge.recovered` when a charge settles after one. The keeper raises each
+ * once per streak, so the merchant hears about an emptied vault before the
+ * missing revenue shows.
+ */
+export type ChargeStreakEvent =
+  | (ChargeStreakBase & {
+      kind: "charge.failing";
+      /** What the vault is missing, decimal string; null when it was not read. */
+      shortfall: string | null;
+      /** Unix seconds of the keeper's next attempt. */
+      nextRetryAt: number;
+      errorCode: string | null;
+    })
+  | (ChargeStreakBase & {
+      kind: "charge.recovered";
+      txHash: string | null;
+    });
+
 export interface WebhookDispatcherOptions {
-  db: DatabaseSync;
+  db: Storage | DatabaseSync;
   events?: EventEmitter | undefined;
   fetchImpl?: typeof globalThis.fetch;
+  lookupImpl?: WebhookLookup | undefined;
   /** Seconds a rotated secret keeps signing beside the new one; 0 drops it at once. */
   secretOverlapSeconds?: number | undefined;
 }
 
 /**
- * Delivers `charged` events to merchant-registered webhooks.
+ * Delivers `charged` events, and the keeper's `charge.failing` and
+ * `charge.recovered` streak events, to merchant-registered webhooks.
  *
  * Delivery is at-least-once: every charge event creates a pending delivery
  * per active webhook, carried by an idempotency key that is reused across
@@ -122,16 +286,28 @@ export interface WebhookDispatcherOptions {
  * indexer's synchronous SQLite.
  */
 export class WebhookDispatcher {
-  private readonly db: DatabaseSync;
-  private readonly fetchImpl: typeof globalThis.fetch;
+  private readonly db: Storage;
+  private readonly fetchImpl: typeof globalThis.fetch | undefined;
+  private readonly lookupImpl: WebhookLookup;
   private readonly events: EventEmitter;
   private readonly secretOverlapSeconds: number;
 
   constructor(options: WebhookDispatcherOptions) {
-    this.db = options.db;
-    this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+    this.db = asStorage(options.db);
+    this.fetchImpl = options.fetchImpl;
+    this.lookupImpl = options.lookupImpl ?? systemLookup;
     this.events = options.events ?? new EventEmitter();
     this.secretOverlapSeconds = options.secretOverlapSeconds ?? DEFAULT_SECRET_OVERLAP_S;
+  }
+
+  /** Resolve and check the URL before accepting a merchant registration. */
+  async isPublicTarget(url: string): Promise<boolean> {
+    try {
+      await resolvePublicTarget(url, this.lookupImpl);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Subscribe to the indexer's applied events and dispatch charges. */
@@ -148,17 +324,17 @@ export class WebhookDispatcher {
    * sign deliveries; when omitted a server-generated secret is returned
    * to the caller exactly once.
    */
-  register(merchant: string, url: string, secret?: string): WebhookRegistration {
+  async register(merchant: string, url: string, secret?: string): Promise<WebhookRegistration> {
     const value = secret ?? randomUUID();
     const now = Math.floor(Date.now() / 1000);
-    const info = this.db
-      .prepare(
-        `INSERT INTO webhooks (merchant, url, secret, active, failed, failures, created_at)
-         VALUES (?, ?, ?, 1, 0, 0, ?)`,
-      )
-      .run(merchant, url, value, now);
+    const row = await this.db.get<{ id: number }>(
+      `INSERT INTO webhooks (merchant, url, secret, active, failed, failures, created_at)
+       VALUES (?, ?, ?, 1, 0, 0, ?) RETURNING id`,
+      [merchant, url, value, now],
+    );
+    if (!row) throw new Error("webhook registration insert returned no id");
     return {
-      id: (info.lastInsertRowid as number) ?? 0,
+      id: row.id,
       merchant,
       url,
       secret: value,
@@ -167,16 +343,15 @@ export class WebhookDispatcher {
   }
 
   /** The active, non-failed webhooks for a merchant, newest first. */
-  listWebhooks(merchant: string): Webhook[] {
-    return this.db
-      .prepare(
-        `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
-                active, failed, failures, last_attempt, last_status
-           FROM webhooks
-          WHERE merchant = ? AND active = 1 AND failed = 0
-          ORDER BY id DESC`,
-      )
-      .all(merchant) as unknown as Webhook[];
+  listWebhooks(merchant: string): Promise<Webhook[]> {
+    return this.db.all<Webhook>(
+      `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
+              active, failed, failures, last_attempt, last_status
+         FROM webhooks
+        WHERE merchant = ? AND active = 1 AND failed = 0
+        ORDER BY id DESC`,
+      [merchant],
+    );
   }
 
   /**
@@ -185,15 +360,8 @@ export class WebhookDispatcher {
    * merchant can see and remove them. The secret is reduced to its last
    * four characters and never leaves this method whole.
    */
-  listForMerchant(merchant: string): WebhookSummary[] {
-    const rows = this.db
-      .prepare(
-        `SELECT id, url, secret, failed, failures, last_attempt, last_status, created_at
-           FROM webhooks
-          WHERE merchant = ? AND active = 1
-          ORDER BY id DESC`,
-      )
-      .all(merchant) as unknown as Array<{
+  async listForMerchant(merchant: string): Promise<WebhookSummary[]> {
+    const rows = await this.db.all<{
       id: number;
       url: string;
       secret: string;
@@ -202,7 +370,13 @@ export class WebhookDispatcher {
       last_attempt: number | null;
       last_status: number | null;
       created_at: number;
-    }>;
+    }>(
+        `SELECT id, url, secret, failed, failures, last_attempt, last_status, created_at
+           FROM webhooks
+          WHERE merchant = ? AND active = 1
+          ORDER BY id DESC`,
+      [merchant],
+    );
     return rows.map((row) => ({
       id: row.id,
       merchant,
@@ -222,17 +396,17 @@ export class WebhookDispatcher {
    * stop too. The row stays for the delivery history. Returns false when
    * no active webhook with that id belongs to the merchant.
    */
-  deactivate(merchant: string, id: number): boolean {
-    const info = this.db
-      .prepare("UPDATE webhooks SET active = 0 WHERE id = ? AND merchant = ? AND active = 1")
-      .run(id, merchant);
-    if (Number(info.changes) === 0) return false;
-    this.db
-      .prepare(
+  async deactivate(merchant: string, id: number): Promise<boolean> {
+    const row = await this.db.get<{ id: number }>(
+      "UPDATE webhooks SET active = 0 WHERE id = ? AND merchant = ? AND active = 1 RETURNING id",
+      [id, merchant],
+    );
+    if (!row) return false;
+    await this.db.run(
         `UPDATE webhook_deliveries SET status = 'failed', error = 'webhook deleted'
           WHERE webhook_id = ? AND status = 'pending'`,
-      )
-      .run(id);
+      [id],
+    );
     return true;
   }
 
@@ -243,22 +417,22 @@ export class WebhookDispatcher {
    * second rotation within the overlap retires the oldest secret at once.
    * Null when no active webhook with that id belongs to the merchant.
    */
-  rotateSecret(merchant: string, id: number): WebhookRotation | null {
+  async rotateSecret(merchant: string, id: number): Promise<WebhookRotation | null> {
     const secret = randomUUID();
     const previousSecretExpiresAt =
       this.secretOverlapSeconds > 0 ? Math.floor(Date.now() / 1000) + this.secretOverlapSeconds : null;
     // SET expressions read the row as it was, so `previous_secret` takes the
     // secret being replaced.
-    const info = this.db
-      .prepare(
+    const row = await this.db.get<{ id: number }>(
         `UPDATE webhooks
             SET previous_secret = CASE WHEN ? IS NULL THEN NULL ELSE secret END,
                 previous_secret_expires_at = ?,
                 secret = ?
-          WHERE id = ? AND merchant = ? AND active = 1`,
-      )
-      .run(previousSecretExpiresAt, previousSecretExpiresAt, secret, id, merchant);
-    if (Number(info.changes) === 0) return null;
+          WHERE id = ? AND merchant = ? AND active = 1
+          RETURNING id`,
+      [previousSecretExpiresAt, previousSecretExpiresAt, secret, id, merchant],
+    );
+    if (!row) return null;
     return { id, secret, previousSecretExpiresAt };
   }
 
@@ -269,17 +443,16 @@ export class WebhookDispatcher {
    * when no webhook with that id is receiving deliveries for the merchant.
    */
   async ping(merchant: string, id: number): Promise<WebhookTestResult | null> {
-    const webhook = this.db
-      .prepare(
+    const webhook = await this.db.get<WebhookRow>(
         `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
                 active, failed, failures, last_attempt, last_status
            FROM webhooks
           WHERE id = ? AND merchant = ? AND active = 1 AND failed = 0`,
-      )
-      .get(id, merchant) as unknown as WebhookRow | undefined;
+      [id, merchant],
+    );
     if (!webhook) return null;
     const payload = JSON.stringify({ event: "ping", webhook_id: id, merchant });
-    const delivery = this.enqueue(webhook.id, `ping:${randomUUID()}`, randomUUID(), payload);
+    const delivery = await this.enqueue(webhook.id, `ping:${randomUUID()}`, randomUUID(), payload);
     return { deliveryId: delivery.id, ...(await this.attempt(delivery, webhook)) };
   }
 
@@ -288,19 +461,11 @@ export class WebhookDispatcher {
    * newest first, or null when no webhook with that id belongs to the
    * merchant. A deleted webhook keeps its history.
    */
-  history(merchant: string, id: number): WebhookDelivery[] | null {
-    if (!this.db.prepare("SELECT 1 FROM webhooks WHERE id = ? AND merchant = ?").get(id, merchant)) {
+  async history(merchant: string, id: number): Promise<WebhookDelivery[] | null> {
+    if (!await this.db.get("SELECT 1 FROM webhooks WHERE id = ? AND merchant = ?", [id, merchant])) {
       return null;
     }
-    const rows = this.db
-      .prepare(
-        `SELECT id, delivery_id, event_id, attempt, status, http_status, error, next_retry_at, attempted_at
-           FROM webhook_attempts
-          WHERE webhook_id = ?
-          ORDER BY id DESC
-          LIMIT ?`,
-      )
-      .all(id, HISTORY_LIMIT) as unknown as Array<{
+    const rows = await this.db.all<{
       id: number;
       delivery_id: number;
       event_id: string;
@@ -310,7 +475,14 @@ export class WebhookDispatcher {
       error: string | null;
       next_retry_at: number | null;
       attempted_at: number;
-    }>;
+    }>(
+        `SELECT id, delivery_id, event_id, attempt, status, http_status, error, next_retry_at, attempted_at
+           FROM webhook_attempts
+          WHERE webhook_id = ?
+          ORDER BY id DESC
+          LIMIT ?`,
+      [id, HISTORY_LIMIT],
+    );
     return rows.map((row) => ({
       id: row.id,
       deliveryId: row.delivery_id,
@@ -325,12 +497,29 @@ export class WebhookDispatcher {
   }
 
   /** Deliveries due for retry right now, oldest retry first. */
-  dueDeliveries(now: number = Math.floor(Date.now() / 1000)): Array<{
+  async dueDeliveries(now: number = Math.floor(Date.now() / 1000)): Promise<Array<{
     delivery: DeliveryRow;
     webhook: WebhookRow;
-  }> {
-    const rows = this.db
-      .prepare(
+  }>> {
+    const rows = await this.db.all<{
+      id: number;
+      webhook_id: number;
+      event_id: string;
+      idempotency_key: string;
+      attempt: number;
+      status: string;
+      http_status: number | null;
+      response_body: string | null;
+      error: string | null;
+      payload: string;
+      retry_at: number;
+      created_at: number;
+      merchant: string;
+      url: string;
+      secret: string;
+      previous_secret: string | null;
+      previous_secret_expires_at: number | null;
+    }>(
         `SELECT d.id, d.webhook_id, d.event_id, d.idempotency_key, d.attempt, d.status,
                 d.http_status, d.response_body, d.error, d.payload, d.retry_at, d.created_at,
                 w.merchant, w.url, w.secret, w.previous_secret, w.previous_secret_expires_at
@@ -339,26 +528,8 @@ export class WebhookDispatcher {
           WHERE d.status = 'pending' AND d.retry_at <= ? AND w.active = 1 AND w.failed = 0
           ORDER BY d.retry_at
           LIMIT ?`,
-      )
-      .all(now, RETRY_BATCH) as unknown as Array<{
-        id: number;
-        webhook_id: number;
-        event_id: string;
-        idempotency_key: string;
-        attempt: number;
-        status: string;
-        http_status: number | null;
-        response_body: string | null;
-        error: string | null;
-        payload: string;
-        retry_at: number;
-        created_at: number;
-        merchant: string;
-        url: string;
-        secret: string;
-        previous_secret: string | null;
-        previous_secret_expires_at: number | null;
-      }>;
+      [now, RETRY_BATCH],
+    );
     return rows.map((row) => ({
       delivery: {
         id: row.id,
@@ -391,38 +562,31 @@ export class WebhookDispatcher {
   }
 
   /** Inspect every delivery for a webhook, newest first. */
-  deliveries(webhookId: number): Array<{
+  deliveries(webhookId: number): Promise<Array<{
     id: number;
     attempt: number;
     status: string;
     http_status: number | null;
     error: string | null;
     retry_at: number;
-  }> {
-    return this.db
-      .prepare(
+  }>> {
+    return this.db.all(
         `SELECT id, attempt, status, http_status, error, retry_at
            FROM webhook_deliveries
           WHERE webhook_id = ?
           ORDER BY id DESC`,
-      )
-      .all(webhookId) as unknown as Array<{
-      id: number;
-      attempt: number;
-      status: string;
-      http_status: number | null;
-      error: string | null;
-      retry_at: number;
-    }>;
+      [webhookId],
+    );
   }
 
   /** The count of undelivered deliveries for a webhook. */
-  pendingCount(webhookId: number): number {
-    return (
-      this.db
-        .prepare("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE webhook_id = ? AND status = 'pending'")
-        .get(webhookId) as { n: number }
-    ).n;
+  async pendingCount(webhookId: number): Promise<number> {
+    const row = await this.db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM webhook_deliveries WHERE webhook_id = ? AND status = 'pending'",
+      [webhookId],
+    );
+    if (!row) throw new Error("webhook pending count query returned no result");
+    return row.n;
   }
 
   /**
@@ -432,11 +596,10 @@ export class WebhookDispatcher {
   async onApplied(e: DecodedEvent): Promise<void> {
     if (e.name !== "charged") return;
     const [mandateId, , merchant] = e.topics;
-    const webhooks = this.listWebhooks(str(merchant));
+    const webhooks = await this.listWebhooks(str(merchant));
     if (webhooks.length === 0) return;
 
     const eventId = `charge:${e.txHash}`;
-    const idempotencyKey = randomUUID();
     const payload = JSON.stringify({
       event: e.name,
       mandate_id: num(mandateId),
@@ -447,23 +610,61 @@ export class WebhookDispatcher {
       ledger: e.ledger,
     } as Record<string, unknown>);
 
+    await this.broadcast(webhooks, eventId, payload);
+  }
+
+  /**
+   * React to a keeper streak event: every active webhook for the mandate's
+   * merchant gets a `charge.failing` or `charge.recovered` delivery through
+   * the same path, signatures and retries as a charge. The keeper raises each
+   * event once per streak; the event id names the attempt that raised it, so
+   * every retry of the delivery carries the same id.
+   */
+  async onChargeStreak(e: ChargeStreakEvent): Promise<void> {
+    const webhooks = await this.listWebhooks(e.merchant);
+    if (webhooks.length === 0) return;
+
+    const common = {
+      event: e.kind,
+      mandate_id: e.mandateId,
+      subscriber: e.subscriber,
+      merchant: e.merchant,
+      failures: e.failures,
+    };
+    const payload = JSON.stringify(
+      e.kind === "charge.failing"
+        ? { ...common, shortfall: e.shortfall, next_retry_at: e.nextRetryAt, error_code: e.errorCode }
+        : { ...common, tx_hash: e.txHash },
+    );
+
+    await this.broadcast(webhooks, `${e.kind}:${e.mandateId}:${e.attemptId}`, payload);
+  }
+
+  /** One pending delivery and a first attempt per webhook, under one idempotency key. */
+  private async broadcast(webhooks: Webhook[], eventId: string, payload: string): Promise<void> {
+    const idempotencyKey = randomUUID();
     for (const webhook of webhooks) {
-      await this.attempt(this.enqueue(webhook.id, eventId, idempotencyKey, payload), webhook);
+      await this.attempt(await this.enqueue(webhook.id, eventId, idempotencyKey, payload), webhook);
     }
   }
 
   /** Store a pending delivery due now, before its first attempt. */
-  private enqueue(webhookId: number, eventId: string, idempotencyKey: string, payload: string): DeliveryRow {
+  private async enqueue(
+    webhookId: number,
+    eventId: string,
+    idempotencyKey: string,
+    payload: string,
+  ): Promise<DeliveryRow> {
     const now = Math.floor(Date.now() / 1000);
-    const info = this.db
-      .prepare(
-        `INSERT INTO webhook_deliveries
-           (webhook_id, event_id, idempotency_key, attempt, status, retry_at, payload, created_at)
-         VALUES (?, ?, ?, 1, 'pending', ?, ?, ?)`,
-      )
-      .run(webhookId, eventId, idempotencyKey, now, payload, now);
+    const row = await this.db.get<{ id: number }>(
+      `INSERT INTO webhook_deliveries
+         (webhook_id, event_id, idempotency_key, attempt, status, retry_at, payload, created_at)
+       VALUES (?, ?, ?, 1, 'pending', ?, ?, ?) RETURNING id`,
+      [webhookId, eventId, idempotencyKey, now, payload, now],
+    );
+    if (!row) throw new Error("webhook delivery insert returned no id");
     return {
-      id: (info.lastInsertRowid as number) ?? 0,
+      id: row.id,
       webhook_id: webhookId,
       event_id: eventId,
       idempotency_key: idempotencyKey,
@@ -499,8 +700,12 @@ export class WebhookDispatcher {
         },
         body: delivery.payload,
         signal: AbortSignal.timeout(15_000),
+        redirect: "manual",
       };
-      const res = (await this.fetchImpl(webhook.url, init)) as unknown as FetchResponse;
+      const target = await resolvePublicTarget(webhook.url, this.lookupImpl);
+      const res = this.fetchImpl
+        ? (await this.fetchImpl(webhook.url, init)) as unknown as FetchResponse
+        : await postToPinnedAddress(target.url, target.addresses, init);
       httpStatus = res.status;
       ok = res.ok;
       responseBody = await res.text();
@@ -512,24 +717,21 @@ export class WebhookDispatcher {
     let outcome: AttemptOutcome;
     const nextAttempt = delivery.attempt + 1;
     if (ok) {
-      this.db
-        .prepare(
-          `UPDATE webhook_deliveries SET status = 'delivered', http_status = ?, response_body = ?, error = NULL WHERE id = ?`,
-        )
-        .run(httpStatus, responseBody, delivery.id);
+      await this.db.run(
+        `UPDATE webhook_deliveries SET status = 'delivered', http_status = ?, response_body = ?, error = NULL WHERE id = ?`,
+        [httpStatus, responseBody, delivery.id],
+      );
       outcome = { status: "delivered", statusCode: httpStatus, latencyMs, error: null, nextRetryAt: null };
     } else if (nextAttempt > MAX_ATTEMPTS) {
       const finalError = error ?? "delivery failed";
-      this.db
-        .prepare(
-          `UPDATE webhook_deliveries SET status = 'failed', http_status = ?, response_body = ?, error = ? WHERE id = ?`,
-        )
-        .run(httpStatus, responseBody, finalError, delivery.id);
-      this.db
-        .prepare(
-          `UPDATE webhooks SET failed = 1, failures = failures + 1, last_attempt = ?, last_status = ? WHERE id = ?`,
-        )
-        .run(now, httpStatus, webhook.id);
+      await this.db.run(
+        `UPDATE webhook_deliveries SET status = 'failed', http_status = ?, response_body = ?, error = ? WHERE id = ?`,
+        [httpStatus, responseBody, finalError, delivery.id],
+      );
+      await this.db.run(
+        `UPDATE webhooks SET failed = 1, failures = failures + 1, last_attempt = ?, last_status = ? WHERE id = ?`,
+        [now, httpStatus, webhook.id],
+      );
       logger.warn(
         {
           webhookId: webhook.id,
@@ -543,22 +745,20 @@ export class WebhookDispatcher {
       outcome = { status: "failed", statusCode: httpStatus, latencyMs, error: finalError, nextRetryAt: null };
     } else {
       const nextRetryAt = now + backoffSeconds(nextAttempt);
-      this.db
-        .prepare(
-          `UPDATE webhook_deliveries
-             SET attempt = ?, retry_at = ?, status = 'pending', error = ?, http_status = ?, response_body = ?
-           WHERE id = ?`,
-        )
-        .run(nextAttempt, nextRetryAt, error, httpStatus, responseBody, delivery.id);
-      this.db
-        .prepare(
-          `UPDATE webhooks SET last_attempt = ?, last_status = ?, failures = failures + 1 WHERE id = ?`,
-        )
-        .run(now, httpStatus, webhook.id);
+      await this.db.run(
+        `UPDATE webhook_deliveries
+           SET attempt = ?, retry_at = ?, status = 'pending', error = ?, http_status = ?, response_body = ?
+         WHERE id = ?`,
+        [nextAttempt, nextRetryAt, error, httpStatus, responseBody, delivery.id],
+      );
+      await this.db.run(
+        `UPDATE webhooks SET last_attempt = ?, last_status = ?, failures = failures + 1 WHERE id = ?`,
+        [now, httpStatus, webhook.id],
+      );
       outcome = { status: "pending", statusCode: httpStatus, latencyMs, error, nextRetryAt };
     }
 
-    this.record(delivery, outcome, now);
+    await this.record(delivery, outcome, now);
     return outcome;
   }
 
@@ -567,14 +767,12 @@ export class WebhookDispatcher {
    * HISTORY_LIMIT rows. Both statements walk the (webhook_id, id) index, so
    * the cost is O(log n) however long the webhook has existed.
    */
-  private record(delivery: DeliveryRow, outcome: AttemptOutcome, now: number): void {
-    this.db
-      .prepare(
-        `INSERT INTO webhook_attempts
-           (webhook_id, delivery_id, event_id, attempt, status, http_status, error, next_retry_at, attempted_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+  private async record(delivery: DeliveryRow, outcome: AttemptOutcome, now: number): Promise<void> {
+    await this.db.run(
+      `INSERT INTO webhook_attempts
+         (webhook_id, delivery_id, event_id, attempt, status, http_status, error, next_retry_at, attempted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
         delivery.webhook_id,
         delivery.id,
         delivery.event_id,
@@ -584,14 +782,14 @@ export class WebhookDispatcher {
         outcome.error,
         outcome.nextRetryAt,
         now,
-      );
-    this.db
-      .prepare(
-        `DELETE FROM webhook_attempts
-          WHERE webhook_id = ?
-            AND id <= (SELECT id FROM webhook_attempts WHERE webhook_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)`,
-      )
-      .run(delivery.webhook_id, delivery.webhook_id, HISTORY_LIMIT);
+      ],
+    );
+    await this.db.run(
+      `DELETE FROM webhook_attempts
+        WHERE webhook_id = ?
+          AND id <= (SELECT id FROM webhook_attempts WHERE webhook_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?)`,
+      [delivery.webhook_id, delivery.webhook_id, HISTORY_LIMIT],
+    );
   }
 
   /** Deliver every payment due for retry, once each. Returns a pass
@@ -605,22 +803,23 @@ export class WebhookDispatcher {
     let attempted = 0;
     let delivered = 0;
     let failed = 0;
-    for (const { delivery } of this.dueDeliveries(now)) {
+    for (const { delivery } of await this.dueDeliveries(now)) {
       attempted += 1;
-      const { status } = await this.attempt(delivery, this.webhookOf(delivery.webhook_id));
+      const { status } = await this.attempt(delivery, await this.webhookOf(delivery.webhook_id));
       if (status === "delivered") delivered += 1;
       else if (status === "failed") failed += 1;
     }
     return { attempted, delivered, failed };
   }
 
-  private webhookOf(webhookId: number): WebhookRow {
-    return this.db
-      .prepare(
-        `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
-                active, failed, failures, last_attempt, last_status
-           FROM webhooks WHERE id = ?`,
-      )
-      .get(webhookId) as unknown as WebhookRow;
+  private async webhookOf(webhookId: number): Promise<WebhookRow> {
+    const row = await this.db.get<WebhookRow>(
+      `SELECT id, merchant, url, secret, previous_secret, previous_secret_expires_at,
+              active, failed, failures, last_attempt, last_status
+         FROM webhooks WHERE id = ?`,
+      [webhookId],
+    );
+    if (!row) throw new Error(`webhook ${webhookId} was not found for delivery`);
+    return row;
   }
 }

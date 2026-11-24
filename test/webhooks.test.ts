@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { test, describe, before, after } from "node:test";
 import type { Server } from "node:http";
-import { Keypair, StrKey } from "@stellar/stellar-sdk";
+import { Account, Keypair, StrKey, rpc, type Transaction } from "@stellar/stellar-sdk";
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp } from "../src/app.ts";
 import { Indexer } from "../src/indexer.ts";
+import { Keeper, type KeeperRpc } from "../src/keeper.ts";
 import { WebhookDispatcher } from "../src/lib/webhooks.ts";
 import type { Config, NetworkConfig } from "../src/config.ts";
 import type { DecodedEvent } from "../src/lib/stellar.ts";
@@ -78,10 +79,10 @@ describe("webhooks", () => {
   before(async () => {
     db = openDatabase(":memory:");
     ix = new Indexer(db, {} as never, {} as never);
-    ix.apply(ev("plan_created", [merchant, 1n], {
+    await ix.apply(ev("plan_created", [merchant, 1n], {
       token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Pro",
     }));
-    ix.apply(ev("subscribed", [1n, SUBSCRIBER, merchant], {
+    await ix.apply(ev("subscribed", [1n, SUBSCRIBER, merchant], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
     }));
 
@@ -112,6 +113,10 @@ describe("webhooks", () => {
       db,
       events: ix.events,
       fetchImpl: captured as unknown as typeof globalThis.fetch,
+      lookupImpl: async (hostname) => [{
+        address: hostname === "internal.payflow.example" ? "10.1.2.3" : "93.184.216.34",
+        family: 4,
+      }],
     });
     dispatcher.bind(ix.events);
 
@@ -218,9 +223,38 @@ describe("webhooks", () => {
     assert.equal(res.status, 400);
   });
 
+  test("registration refuses loopback IPs and hostnames resolving to private addresses", async () => {
+    for (const target of [
+      "http://127.0.0.1/admin",
+      "http://[::1]/admin",
+      "http://[::ffff:127.0.0.1]/admin",
+      "https://internal.payflow.example/hook",
+    ]) {
+      const timestamp = nowSec();
+      const res = await post("/api/webhooks", {
+        merchant,
+        url: target,
+        secret,
+        timestamp,
+        signature: sign(merchant, target, timestamp, seed),
+      });
+      assert.equal(res.status, 400, target);
+      assert.equal(
+        (res.body as { error: { code: string } }).error.code,
+        "invalid_request",
+        target,
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) AS n FROM webhooks WHERE url = ?").get(target) as { n: number }).n,
+        0,
+        "unsafe target was not stored",
+      );
+    }
+  });
+
   test("a charge event dispatches a signed POST to each registered webhook", async () => {
     calls.length = 0;
-    ix.apply(ev("charged", [1n, SUBSCRIBER, merchant], {
+    await ix.apply(ev("charged", [1n, SUBSCRIBER, merchant], {
       amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 1_700_000_000n,
     }, "tx-charge-1"));
 
@@ -252,11 +286,11 @@ describe("webhooks", () => {
 
   test("delivery retries with backoff and gives up after five attempts", async () => {
     const failing = Keypair.random().publicKey();
-    dispatcher.register(failing, "https://payflow.example/failing", "another-secret");
+    await dispatcher.register(failing, "https://payflow.example/failing", "another-secret");
     calls.length = 0;
 
     const T = nowSec();
-    ix.apply(ev("charged", [7n, SUBSCRIBER, failing], {
+    await ix.apply(ev("charged", [7n, SUBSCRIBER, failing], {
       amount: 5_000_000n, fee: 0n, charges_made: 1n, next_charge: 1n,
     }, "tx-charge-fail"));
     await waitFor(() => calls.length >= 1);
@@ -314,7 +348,7 @@ describe("webhooks", () => {
     assert.equal(webhook.failures, 5);
 
     calls.length = 0;
-    ix.apply(ev("charged", [8n, SUBSCRIBER, failing], {
+    await ix.apply(ev("charged", [8n, SUBSCRIBER, failing], {
       amount: 1n, fee: 0n, charges_made: 1n, next_charge: 1n,
     }, "tx-charge-after-giveup"));
     await new Promise((resolve) => setImmediate(resolve));
@@ -324,10 +358,10 @@ describe("webhooks", () => {
 
   test("retryDue delivers pending deliveries at their retry time", async () => {
     const ok = Keypair.random().publicKey();
-    dispatcher.register(ok, "https://payflow.example/ok", "ok-secret");
+    await dispatcher.register(ok, "https://payflow.example/ok", "ok-secret");
     calls.length = 0;
 
-    ix.apply(ev("charged", [9n, SUBSCRIBER, ok], {
+    await ix.apply(ev("charged", [9n, SUBSCRIBER, ok], {
       amount: 1n, fee: 0n, charges_made: 1n, next_charge: 1n,
     }, "tx-charge-ok"));
 
@@ -338,7 +372,7 @@ describe("webhooks", () => {
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     const id = (db.prepare("SELECT id FROM webhooks WHERE merchant = ?").get(ok) as { id: number }).id;
-    assert.equal(dispatcher.pendingCount(id), 0, "a delivered webhook has no pending deliveries");
+    assert.equal(await dispatcher.pendingCount(id), 0, "a delivered webhook has no pending deliveries");
   });
   describe("listing and deleting", () => {
     const ownerSeed = StrKey.encodeEd25519SecretSeed(crypto.getRandomValues(new Uint8Array(32)));
@@ -360,9 +394,9 @@ describe("webhooks", () => {
       });
 
     test("lists the merchant's webhooks without their secrets", async () => {
-      const first = dispatcher.register(owner, "https://owner.example/a", "secret-aaaa-1234");
-      const second = dispatcher.register(owner, "https://owner.example/b");
-      dispatcher.register(other, "https://other.example/x", "not-yours");
+      const first = await dispatcher.register(owner, "https://owner.example/a", "secret-aaaa-1234");
+      const second = await dispatcher.register(owner, "https://owner.example/b");
+      await dispatcher.register(other, "https://other.example/x", "not-yours");
 
       const t = nowSec();
       const res = await fetch(listUrl(owner, t, listSig(owner, t, ownerSeed)));
@@ -406,7 +440,7 @@ describe("webhooks", () => {
     });
 
     test("deleting with a wrong or expired signature is a 401 and deletes nothing", async () => {
-      const hook = dispatcher.register(owner, "https://owner.example/keep", "keep-secret");
+      const hook = await dispatcher.register(owner, "https://owner.example/keep", "keep-secret");
       const t = nowSec();
       let res = await del(hook.id, { merchant: owner, timestamp: t, signature: deleteSig(owner, hook.id, t, otherSeed) });
       assert.equal(res.status, 401);
@@ -421,7 +455,7 @@ describe("webhooks", () => {
     });
 
     test("a merchant cannot delete another merchant's webhook", async () => {
-      const theirs = dispatcher.register(other, "https://other.example/y", "theirs");
+      const theirs = await dispatcher.register(other, "https://other.example/y", "theirs");
       const t = nowSec();
       const res = await del(theirs.id, { merchant: owner, timestamp: t, signature: deleteSig(owner, theirs.id, t, ownerSeed) });
       assert.equal(res.status, 404);
@@ -432,8 +466,8 @@ describe("webhooks", () => {
     test("a deleted webhook receives no further deliveries", async () => {
       const seedC = StrKey.encodeEd25519SecretSeed(crypto.getRandomValues(new Uint8Array(32)));
       const merchantC = Keypair.fromSecret(seedC).publicKey();
-      const keep = dispatcher.register(merchantC, "https://c.example/keep", "keep");
-      const gone = dispatcher.register(merchantC, "https://c.example/failing-gone", "gone");
+      const keep = await dispatcher.register(merchantC, "https://c.example/keep", "keep");
+      const gone = await dispatcher.register(merchantC, "https://c.example/failing-gone", "gone");
 
       // A charge leaves a pending retry on the failing endpoint.
       calls.length = 0;
@@ -443,12 +477,12 @@ describe("webhooks", () => {
       await waitFor(() => calls.length >= 2);
       await new Promise((resolve) => setImmediate(resolve));
       await new Promise((resolve) => setImmediate(resolve));
-      assert.equal(dispatcher.pendingCount(gone.id), 1);
+      assert.equal(await dispatcher.pendingCount(gone.id), 1);
 
       const t = nowSec();
       const res = await del(gone.id, { merchant: merchantC, timestamp: t, signature: deleteSig(merchantC, gone.id, t, seedC) });
       assert.equal(res.status, 204);
-      assert.equal(dispatcher.pendingCount(gone.id), 0, "scheduled retries are dropped");
+      assert.equal(await dispatcher.pendingCount(gone.id), 0, "scheduled retries are dropped");
 
       // Neither the retry loop nor a new charge reaches the deleted endpoint.
       calls.length = 0;
@@ -471,7 +505,7 @@ describe("webhooks", () => {
     });
 
     test("the delete proof may be sent as query parameters", async () => {
-      const hook = dispatcher.register(owner, "https://owner.example/q", "q-secret");
+      const hook = await dispatcher.register(owner, "https://owner.example/q", "q-secret");
       const t = nowSec();
       const query = new URLSearchParams({
         merchant: owner,
@@ -481,5 +515,165 @@ describe("webhooks", () => {
       const res = await fetch(`${base}/api/webhooks/${hook.id}?${query}`, { method: "DELETE" });
       assert.equal(res.status, 204);
     });
+  });
+});
+
+/** Issue #145: the keeper's streak events reach the merchant's webhooks. */
+describe("charge streak webhooks", () => {
+  const merchant = Keypair.random().publicKey();
+  const secret = "streak-secret";
+  const received: Array<{ url: string; signature: string | null; raw: string }> = [];
+  const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    received.push({
+      url: String(input),
+      signature: new Headers(init?.headers).get("Payflow-Signature"),
+      raw: String(init?.body),
+    });
+    return new Response("ok", { status: 200 });
+  };
+  const dispatcherFor = (db: ReturnType<typeof openDatabase>): WebhookDispatcher =>
+    new WebhookDispatcher({
+      db,
+      fetchImpl: fetchImpl as typeof fetch,
+      lookupImpl: async () => [{ address: "93.184.216.34", family: 4 }],
+    });
+
+  test("charge.failing carries the mandate, shortfall and next retry, signed like a charge", async () => {
+    received.length = 0;
+    const db = openDatabase(":memory:");
+    const dispatcher = dispatcherFor(db);
+    const hook = await dispatcher.register(merchant, "https://merchant.example/streaks", secret);
+
+    await dispatcher.onChargeStreak({
+      kind: "charge.failing",
+      mandateId: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 3,
+      attemptId: 42,
+      shortfall: "600",
+      nextRetryAt: 10_420,
+      errorCode: "INSUFFICIENT_BALANCE",
+    });
+
+    assert.equal(received.length, 1);
+    const [delivery] = received;
+    assert.deepEqual(JSON.parse(delivery!.raw), {
+      event: "charge.failing",
+      mandate_id: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 3,
+      shortfall: "600",
+      next_retry_at: 10_420,
+      error_code: "INSUFFICIENT_BALANCE",
+    });
+    assert.equal(
+      delivery!.signature,
+      `sha256=${createHmac("sha256", secret).update(delivery!.raw).digest("hex")}`,
+    );
+    assert.equal((await dispatcher.history(merchant, hook.id))![0]!.eventId, "charge.failing:7:42");
+    db.close();
+  });
+
+  test("charge.recovered carries the settling transaction", async () => {
+    received.length = 0;
+    const db = openDatabase(":memory:");
+    const dispatcher = dispatcherFor(db);
+    dispatcher.register(merchant, "https://merchant.example/streaks", secret);
+
+    await dispatcher.onChargeStreak({
+      kind: "charge.recovered",
+      mandateId: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 4,
+      attemptId: 43,
+      txHash: "ab".repeat(32),
+    });
+
+    assert.deepEqual(JSON.parse(received[0]!.raw), {
+      event: "charge.recovered",
+      mandate_id: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 4,
+      tx_hash: "ab".repeat(32),
+    });
+    db.close();
+  });
+
+  test("a merchant without webhooks is sent nothing", async () => {
+    received.length = 0;
+    const db = openDatabase(":memory:");
+    await dispatcherFor(db).onChargeStreak({
+      kind: "charge.recovered",
+      mandateId: 7,
+      subscriber: SUBSCRIBER,
+      merchant,
+      failures: 3,
+      attemptId: 1,
+      txHash: null,
+    });
+    assert.equal(received.length, 0);
+    assert.equal((db.prepare("SELECT COUNT(*) AS n FROM webhook_deliveries").get() as { n: number }).n, 0);
+    db.close();
+  });
+
+  test("a failing then settling mandate is delivered each event once per streak", async () => {
+    received.length = 0;
+    const db = openDatabase(":memory:");
+    const dispatcher = dispatcherFor(db);
+    dispatcher.register(merchant, "https://merchant.example/streaks", secret);
+    db.prepare(
+      `INSERT INTO mandates (id, subscriber, merchant, plan_id, amount, period, next_charge, status, ledger)
+       VALUES (1, ?, ?, 1, '10', 60, 1000, 'Active', 1)`,
+    ).run(SUBSCRIBER, merchant);
+
+    const key = Keypair.random();
+    const state = { failing: true };
+    const server = {
+      getFeeStats: async () => ({ sorobanInclusionFee: { p90: "100" } }),
+      getAccount: async () => new Account(key.publicKey(), "1"),
+      prepareTransaction: async (tx: Transaction) => {
+        if (state.failing) throw new Error("HostError: Error(Contract, #3)");
+        return tx;
+      },
+      sendTransaction: async (tx: Transaction) => ({
+        status: "PENDING",
+        hash: Buffer.from(tx.hash()).toString("hex"),
+      }),
+      getTransaction: async () => ({ status: rpc.Api.GetTransactionStatus.SUCCESS }),
+    } as unknown as KeeperRpc;
+    const keeper = new Keeper(
+      db,
+      server,
+      {
+        SUBSCRIPTION_ID: StrKey.encodeContract(Buffer.alloc(32)),
+        NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+        KEEPER_SECRET: key.secret(),
+        KEEPER_MAX_FEE: "100000",
+      } as unknown as Config,
+      (event) => dispatcher.onChargeStreak(event),
+    );
+
+    // Five failed passes, each at the mandate's retry time, then a settlement
+    // and one more pass that finds nothing due.
+    let now = 10_000;
+    for (let pass = 0; pass < 5; pass += 1) {
+      await keeper.tick(now);
+      now += keeper.retryIn(1, now);
+    }
+    state.failing = false;
+    await keeper.tick(now);
+    await keeper.tick(now);
+    await waitFor(() => received.length >= 2);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(
+      received.map((r) => (JSON.parse(r.raw) as { event: string }).event),
+      ["charge.failing", "charge.recovered"],
+    );
+    db.close();
   });
 });

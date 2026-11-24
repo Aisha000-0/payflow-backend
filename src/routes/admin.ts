@@ -18,6 +18,9 @@ export interface AdminHooks {
   keeperHistory?: () => unknown;
   pauseIndexer?: () => unknown;
   resumeIndexer?: () => unknown;
+  pruneData?: (daysToKeep?: number) => Promise<unknown>;
+  getAuditLogs?: (limit: number) => unknown;
+  getPastDueMandates?: () => unknown;
 }
 
 /** Scoped operation that a token is allowed to perform. */
@@ -121,7 +124,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const run = hooks.reindex;
     if (!run) {
-      sendApiError(res, req, 503, "reindex_unavailable");
+      sendApiError(res, req, 503, "reindex_unavailable", undefined, undefined, 30);
       return;
     }
     await respond(req, res, "reindex_failed", run);
@@ -135,7 +138,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const run = hooks.keeperPass;
     if (!run) {
-      sendApiError(res, req, 503, "keeper_unavailable");
+      sendApiError(res, req, 503, "keeper_unavailable", undefined, undefined, 30);
       return;
     }
     await respond(req, res, "keeper_pass_failed", run);
@@ -149,7 +152,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const read = hooks.keeperBackoff;
     if (!read) {
-      sendApiError(res, req, 503, "keeper_unavailable");
+      sendApiError(res, req, 503, "keeper_unavailable", undefined, undefined, 30);
       return;
     }
     res.json({ status: "ok", backoff: read() ?? [] });
@@ -158,7 +161,7 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
   // Runtime indexer control. Pause holds the scheduled passes back; the API
   // keeps serving the projection as it stands. The body reports the new state
   // so an operator can confirm the switch took.
-  r.post("/indexer/pause", (req, res) => {
+  r.post("/indexer/pause", async (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "indexer")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -166,13 +169,13 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const pause = hooks.pauseIndexer;
     if (!pause) {
-      sendApiError(res, req, 503, "indexer_unavailable");
+      sendApiError(res, req, 503, "indexer_unavailable", undefined, undefined, 30);
       return;
     }
-    res.json({ status: "ok", paused: true, result: pause() ?? null });
+    res.json({ status: "ok", paused: true, result: (await pause()) ?? null });
   });
 
-  r.post("/indexer/resume", (req, res) => {
+  r.post("/indexer/resume", async (req, res) => {
     const reqWithToken = req as Request & { adminToken?: AdminToken };
     if (reqWithToken.adminToken && !hasScope(reqWithToken.adminToken, "indexer")) {
       sendApiError(res, req, 403, "unauthorized", "Insufficient permissions for this operation");
@@ -180,10 +183,39 @@ export function buildAdminRoutes(token: string | AdminToken[], hooks: AdminHooks
     }
     const resume = hooks.resumeIndexer;
     if (!resume) {
-      sendApiError(res, req, 503, "indexer_unavailable");
+      sendApiError(res, req, 503, "indexer_unavailable", undefined, undefined, 30);
       return;
     }
-    res.json({ status: "ok", paused: false, result: resume() ?? null });
+    res.json({ status: "ok", paused: false, result: (await resume()) ?? null });
+  });
+
+  r.post("/data/prune", async (req, res) => {
+    const prune = hooks.pruneData;
+    if (!prune) {
+      sendApiError(res, req, 503, "prune_unavailable", undefined, undefined, 30);
+      return;
+    }
+    const daysToKeep = req.query.days !== undefined ? Math.max(0, Number(req.query.days)) : undefined;
+    await respond(req, res, "prune_failed", () => prune(daysToKeep));
+  });
+
+  r.get("/audit-logs", async (req, res) => {
+    const read = hooks.getAuditLogs;
+    if (!read) {
+      sendApiError(res, req, 503, "audit_unavailable", undefined, undefined, 30);
+      return;
+    }
+    const limit = Math.min(1000, Math.max(1, Number(req.query.limit ?? 100)));
+    res.json({ status: "ok", logs: (await read(limit)) ?? [] });
+  });
+
+  r.get("/past-due", async (req, res) => {
+    const read = hooks.getPastDueMandates;
+    if (!read) {
+      sendApiError(res, req, 503, "indexer_unavailable", undefined, undefined, 30);
+      return;
+    }
+    res.json({ status: "ok", past_due: (await read()) ?? [] });
   });
 
   return r;

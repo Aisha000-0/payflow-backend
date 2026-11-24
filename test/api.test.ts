@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test, describe, before, after, mock } from "node:test";
-import type { Server } from "node:http";
+import http, { type Server } from "node:http";
+import { gunzipSync } from "node:zlib";
 import express, { type Express, type Request, type Response } from "express";
 import { openDatabase } from "../src/lib/db.ts";
 import { createApp, errorHandler, loggableError } from "../src/app.ts";
@@ -63,43 +64,43 @@ const ev = (name: string, topics: unknown[], data: Record<string, unknown>, tx =
 
 before(async () => {
   ix = new Indexer(db, {} as never, {} as never);
-  ix.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
-  ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
+  await ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
   }));
-  ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
   }, "tx1"));
-  ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_A"], { amount: 9_007_199_254_740_993n, balance: 9_007_199_254_740_993n }, "vault-a"), ledger: 9 });
-  ix.apply({ ...ev("withdraw", [SUBSCRIBER, "TOKEN_A"], { amount: 3n, balance: 9_007_199_254_740_990n }, "vault-b"), ledger: 10 });
-  ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_B"], { amount: 20n, balance: 20n }, "vault-c"), ledger: 10 });
-  ix.apply({ ...ev("debit", [SUBSCRIBER, "TOKEN_A"], { amount: 5n, balance: 9_007_199_254_740_985n }, "vault-d"), ledger: 10 });
-  ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "fee-1"), ledger: 8 });
-  ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 125n, new_fee_bps: 150n }, "fee-2"), ledger: 12 });
+  await ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_A"], { amount: 9_007_199_254_740_993n, balance: 9_007_199_254_740_993n }, "vault-a"), ledger: 9 });
+  await ix.apply({ ...ev("withdraw", [SUBSCRIBER, "TOKEN_A"], { amount: 3n, balance: 9_007_199_254_740_990n }, "vault-b"), ledger: 10 });
+  await ix.apply({ ...ev("deposit", [SUBSCRIBER, "TOKEN_B"], { amount: 20n, balance: 20n }, "vault-c"), ledger: 10 });
+  await ix.apply({ ...ev("debit", [SUBSCRIBER, "TOKEN_A"], { amount: 5n, balance: 9_007_199_254_740_985n }, "vault-d"), ledger: 10 });
+  await ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 100n, new_fee_bps: 125n }, "fee-1"), ledger: 8 });
+  await ix.apply({ ...ev("fee_changed", [MERCHANT], { old_fee_bps: 125n, new_fee_bps: 150n }, "fee-2"), ledger: 12 });
 
   // A yearly plan: one charge of 120_000_000 per 365-day period, next charge
   // far in the future so it never lands in the due list.
-  ix.apply(ev("subscribed", [2n, SUBSCRIBER, YEARLY_MERCHANT], {
+  await ix.apply(ev("subscribed", [2n, SUBSCRIBER, YEARLY_MERCHANT], {
     plan_id: 1n, amount: 120_000_000n, period: 31_536_000n, next_charge: 4_000_000_000n,
   }, "tx2"));
 
   // Forecast fixtures: a daily mandate net of a 1% fee, and one capped at two
   // charges. The first charge is an hour away, so /due stays empty.
-  ix.apply(ev("subscribed", [3n, SUBSCRIBER, FORECAST_MERCHANT], {
+  await ix.apply(ev("subscribed", [3n, SUBSCRIBER, FORECAST_MERCHANT], {
     plan_id: 1n, amount: 5_000_000n, period: 86_400n,
     next_charge: BigInt(NOW + 3_600), max_charges: 0n, fee_bps: 100n,
   }, "tx3"));
-  ix.apply(ev("subscribed", [4n, SUBSCRIBER, CAPPED_MERCHANT], {
+  await ix.apply(ev("subscribed", [4n, SUBSCRIBER, CAPPED_MERCHANT], {
     plan_id: 1n, amount: 2_000_000n, period: 86_400n,
     next_charge: BigInt(NOW + 3_600), max_charges: 2n, fee_bps: 0n,
   }, "tx4"));
 
   // A second projection with disjoint ids, so cross-network leakage is visible.
   const ixMainnet = new Indexer(mainnetDb, {} as never, {} as never);
-  ixMainnet.apply(ev("plan_created", [OTHER_MERCHANT, 5n], {
+  await ixMainnet.apply(ev("plan_created", [OTHER_MERCHANT, 5n], {
     token: "C", amount: 20_000_000n, period: 2_592_000n,
   }, "tm1"));
-  ixMainnet.apply(ev("subscribed", [5n, OTHER_SUBSCRIBER, OTHER_MERCHANT], {
+  await ixMainnet.apply(ev("subscribed", [5n, OTHER_SUBSCRIBER, OTHER_MERCHANT], {
     plan_id: 5n, amount: 20_000_000n, period: 2_592_000n, next_charge: 1n,
   }, "tm2"));
 
@@ -283,6 +284,56 @@ describe("http api", () => {
     assert.equal((body.charges as unknown[]).length, 1);
   });
 
+  test("mandate charge history filters by unix seconds or an ISO date, inclusively", async () => {
+    const row = db.prepare("SELECT created_at FROM charges WHERE tx_hash = ?").get("tx1") as {
+      created_at: number;
+    };
+    const second = Math.floor(row.created_at / 1000);
+    const iso = new Date(second * 1000).toISOString();
+
+    const seconds = await get<{ charges: unknown[] }>(
+      `/api/mandates/1/charges?from=${second}&to=${second}`,
+    );
+    assert.equal(seconds.status, 200);
+    assert.equal(seconds.body.charges.length, 1, "bounds include their own second");
+
+    const byIso = await get<{ charges: unknown[] }>(
+      `/api/mandates/1/charges?from=${encodeURIComponent(iso)}&to=${encodeURIComponent(iso)}`,
+    );
+    assert.equal(byIso.status, 200);
+    assert.equal(byIso.body.charges.length, 1);
+
+    const byDay = await get<{ charges: unknown[] }>(
+      `/api/mandates/1/charges?from=${iso.slice(0, 10)}&to=${iso.slice(0, 10)}`,
+    );
+    assert.equal(byDay.status, 200);
+    assert.equal(byDay.body.charges.length, 1, "a date-only bound covers that UTC day");
+
+    const outside = await get<{ charges: unknown[] }>(
+      `/api/mandates/1/charges?from=${second + 1}`,
+    );
+    assert.equal(outside.status, 200);
+    assert.equal(outside.body.charges.length, 0);
+  });
+
+  test("an invalid charge-date range is 400 and names the parameter", async () => {
+    const second = 1_700_000_000;
+    const reversed = await get<{
+      error: { code: string; details?: { path: string; message: string }[] };
+    }>(`/api/mandates/1/charges?from=${second}&to=${second - 1}`);
+    assert.equal(reversed.status, 400);
+    assert.equal(reversed.body.error.code, "invalid_request");
+    assert.equal(reversed.body.error.details?.[0]?.path, "from");
+    assert.match(reversed.body.error.details?.[0]?.message ?? "", /after/);
+
+    const malformed = await get<{
+      error: { code: string; details?: { path: string; message: string }[] };
+    }>("/api/mandates/1/charges?from=not-a-date");
+    assert.equal(malformed.status, 400);
+    assert.equal(malformed.body.error.code, "invalid_request");
+    assert.equal(malformed.body.error.details?.[0]?.path, "from");
+  });
+
   test("vault balances use the latest event per token without losing precision", async () => {
     const { status: code, body } = await get(`/api/vault/${SUBSCRIBER}`);
     assert.equal(code, 200);
@@ -458,6 +509,8 @@ describe("http api", () => {
         mandateCount: 1,
         chargeCount: 1,
         totalCollected: "9900000",
+        // Net of the 100000 fee the subscriber's 10000000 charge paid.
+        ltv: "9900000",
       },
     ]);
   });
@@ -465,7 +518,7 @@ describe("http api", () => {
   test("subscriber with mandates but no settled charges still appears at zero", async () => {
     const { body } = await get(`/api/merchants/${YEARLY_MERCHANT}/subscribers`);
     assert.deepEqual(body.subscribers, [
-      { subscriber: SUBSCRIBER, mandateCount: 1, chargeCount: 0, totalCollected: "0" },
+      { subscriber: SUBSCRIBER, mandateCount: 1, chargeCount: 0, totalCollected: "0", ltv: "0" },
     ]);
   });
 
@@ -677,11 +730,11 @@ describe("merchant summary caching", () => {
     const memDb = openDatabase(":memory:");
     const cache = new MerchantSummaryCache();
     const indexer = new Indexer(memDb, {} as never, {} as never, cache);
-    indexer.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
-    indexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+    await indexer.apply(ev("plan_created", [MERCHANT, 1n], { token: "C", amount: 10_000_000n, period: 2_592_000n }));
+    await indexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n,
     }));
-    indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+    await indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
       amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "tx1"));
 
@@ -697,7 +750,7 @@ describe("merchant summary caching", () => {
       assert.equal(first.totalCollected, "9900000");
 
       // Apply a second charge
-      indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      await indexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
         amount: 5_000_000n, fee: 50_000n, charges_made: 2n, next_charge: 5_000_000_000n,
       }, "tx2"));
 
@@ -711,7 +764,7 @@ describe("merchant summary caching", () => {
     }
   });
 
-  test("memory is bounded by evicting oldest entries", () => {
+  test("memory is bounded by evicting oldest entries", async () => {
     const cache = new MerchantSummaryCache(2);
     const mockSummary = (m: string): MerchantSummary => ({
       merchant: m,
@@ -723,19 +776,19 @@ describe("merchant summary caching", () => {
       tokens: [],
     });
 
-    cache.set("m1", mockSummary("m1"));
-    cache.set("m2", mockSummary("m2"));
+    await cache.set("m1", mockSummary("m1"));
+    await cache.set("m2", mockSummary("m2"));
     assert.equal(cache.size, 2);
 
     // Access m1 so m2 is the least recently used
-    assert.equal(cache.get("m1")?.merchant, "m1");
+    assert.equal((await cache.get("m1"))?.merchant, "m1");
 
     // Inserting 3rd entry evicts m2
-    cache.set("m3", mockSummary("m3"));
+    await cache.set("m3", mockSummary("m3"));
     assert.equal(cache.size, 2);
-    assert.equal(cache.get("m1")?.merchant, "m1");
-    assert.equal(cache.get("m2"), undefined);
-    assert.equal(cache.get("m3")?.merchant, "m3");
+    assert.equal((await cache.get("m1"))?.merchant, "m1");
+    assert.equal(await cache.get("m2"), undefined);
+    assert.equal((await cache.get("m3"))?.merchant, "m3");
   });
 });
 
@@ -743,7 +796,7 @@ describe("server-sent event stream", () => {
   test("streams a charge and removes its listener when the client disconnects", async () => {
     const streamDb = openDatabase(":memory:");
     const streamIndexer = new Indexer(streamDb, {} as never, {} as never);
-    streamIndexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+    await streamIndexer.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
       plan_id: 1n,
       amount: 10_000_000n,
       period: 2_592_000n,
@@ -772,15 +825,17 @@ describe("server-sent event stream", () => {
     try {
       const response = await fetch(`${streamBase}/api/stream?merchant=${MERCHANT}`, {
         signal: controller.signal,
+        headers: { "accept-encoding": "gzip" },
       });
       assert.equal(response.status, 200);
       assert.equal(response.headers.get("content-type"), "text/event-stream; charset=utf-8");
       assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("content-encoding"), null);
       assert.equal(streamIndexer.events.listenerCount("applied"), listenerCount + 1);
       const reader = response.body!.getReader();
       await reader.read();
 
-      streamIndexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+      await streamIndexer.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
         amount: 9_900_000n,
         fee: 100_000n,
         charges_made: 1n,
@@ -803,6 +858,74 @@ describe("server-sent event stream", () => {
     } finally {
       streamServer.close();
       streamDb.close();
+    }
+  });
+});
+
+describe("response compression", () => {
+  test("compresses large JSON responses and reports size reduction", async () => {
+    const largeDb = openDatabase(":memory:");
+    const largeIx = new Indexer(largeDb, {} as never, {} as never);
+    for (let i = 1; i <= 40; i += 1) {
+      await largeIx.apply(ev("plan_created", [MERCHANT, BigInt(i)], {
+        token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: `plan-${i}-${"x".repeat(20)}`,
+      }, `plan-${i}`));
+    }
+    const app = createApp(largeDb, config);
+    const server = await new Promise<Server>((resolve) => {
+      const listening = app.listen(0, () => resolve(listening));
+    });
+    const port = (server.address() as { port: number }).port;
+    try {
+      const body = await new Promise<Buffer>((resolve, reject) => {
+        const req = http.request(
+          { hostname: "127.0.0.1", port, path: "/api/plans?limit=50", headers: { "accept-encoding": "gzip" } },
+          (res) => {
+            assert.equal(res.statusCode, 200);
+            assert.equal(res.headers["content-encoding"], "gzip");
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+            res.on("end", () => resolve(Buffer.concat(chunks)));
+            res.on("error", reject);
+          },
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      const decoded = gunzipSync(body).toString("utf8");
+      const payload = JSON.parse(decoded) as { plans: unknown[] };
+      assert.ok(payload.plans.length >= 40);
+      assert.ok(Buffer.byteLength(decoded) > 1024);
+      assert.ok(body.length < Buffer.byteLength(decoded), `compressed ${body.length} >= raw ${Buffer.byteLength(decoded)}`);
+    } finally {
+      server.close();
+      largeDb.close();
+    }
+  });
+
+  test("does not compress small responses below threshold", async () => {
+    const app = createApp(openDatabase(":memory:"), config);
+    const server = await new Promise<Server>((resolve) => {
+      const listening = app.listen(0, () => resolve(listening));
+    });
+    const port = (server.address() as { port: number }).port;
+    try {
+      const res = await new Promise<http.IncomingMessage>((resolve, reject) => {
+        const req = http.request(
+          { hostname: "127.0.0.1", port, path: "/api/stats", headers: { "accept-encoding": "gzip" } },
+          (response) => resolve(response),
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      const chunks: Buffer[] = [];
+      for await (const chunk of res) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const body = Buffer.concat(chunks);
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.headers["content-encoding"], undefined);
+      assert.ok(body.length < 1024);
+    } finally {
+      server.close();
     }
   });
 });
@@ -850,29 +973,29 @@ describe("stats volume", () => {
   before(async () => {
     // One active merchant with a recent charge and one from two days ago, and
     // a cancelled merchant that must not count as active.
-    statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
+    await statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
       token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
     }));
-    statsIx.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+    await statsIx.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }));
-    statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+    await statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
       amount: 2_000_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "tx-old"));
-    statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+    await statsIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
       amount: 3_000_000n, fee: 150_000n, charges_made: 2n, next_charge: 4_000_000_000n,
     }, "tx-recent"));
     statsDb
       .prepare("UPDATE charges SET created_at = ? WHERE tx_hash = ?")
       .run(Date.now() - 2 * 86_400_000, "tx-old");
 
-    statsIx.apply(ev("plan_created", [MERCHANT2, 2n], {
+    await statsIx.apply(ev("plan_created", [MERCHANT2, 2n], {
       token: "CTOKEN", amount: 1_000_000n, period: 2_592_000n, name: "p2",
     }));
-    statsIx.apply(ev("subscribed", [2n, SUBSCRIBER, MERCHANT2], {
+    await statsIx.apply(ev("subscribed", [2n, SUBSCRIBER, MERCHANT2], {
       plan_id: 2n, amount: 1_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }));
-    statsIx.apply(ev("cancelled", [2n, SUBSCRIBER], { charges_made: 0 }));
+    await statsIx.apply(ev("cancelled", [2n, SUBSCRIBER], { charges_made: 0 }));
 
     const app = createApp(statsDb, config);
     await new Promise<void>((resolve) => {
@@ -951,17 +1074,17 @@ describe("merchant revenue per token", () => {
       [3n, TOKEN_C, 2_000_000n],
     ];
     for (const [id, token, amount] of plans) {
-      tokenIx.apply(ev("plan_created", [MERCHANT, id], {
+      await tokenIx.apply(ev("plan_created", [MERCHANT, id], {
         token, amount, period: 2_592_000n, name: `p${id}`,
       }));
-      tokenIx.apply(ev("subscribed", [id, SUBSCRIBER, MERCHANT], {
+      await tokenIx.apply(ev("subscribed", [id, SUBSCRIBER, MERCHANT], {
         plan_id: id, amount, period: 2_592_000n, next_charge: 4_000_000_000n,
       }));
     }
-    tokenIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+    await tokenIx.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
       amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "ta1"));
-    tokenIx.apply(ev("charged", [2n, SUBSCRIBER, MERCHANT], {
+    await tokenIx.apply(ev("charged", [2n, SUBSCRIBER, MERCHANT], {
       amount: 4_950_000n, fee: 50_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "tb1"));
 
@@ -1025,24 +1148,24 @@ describe("per-plan statistics", () => {
 
   before(async () => {
     // Plan 1: one Active mandate with two settled charges, one Cancelled.
-    statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
+    await statsIx.apply(ev("plan_created", [MERCHANT, 1n], {
       token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Popular",
     }));
-    statsIx.apply(ev("subscribed", [1n, STATS_SUB_A, MERCHANT], {
+    await statsIx.apply(ev("subscribed", [1n, STATS_SUB_A, MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }));
-    statsIx.apply(ev("subscribed", [2n, STATS_SUB_B, MERCHANT], {
+    await statsIx.apply(ev("subscribed", [2n, STATS_SUB_B, MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }));
-    statsIx.apply(ev("cancelled", [2n, STATS_SUB_B], { charges_made: 0 }, "tx-cancel"));
-    statsIx.apply(ev("charged", [1n, STATS_SUB_A, MERCHANT], {
+    await statsIx.apply(ev("cancelled", [2n, STATS_SUB_B], { charges_made: 0 }, "tx-cancel"));
+    await statsIx.apply(ev("charged", [1n, STATS_SUB_A, MERCHANT], {
       amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
     }, "tx-c1"));
-    statsIx.apply(ev("charged", [1n, STATS_SUB_A, MERCHANT], {
+    await statsIx.apply(ev("charged", [1n, STATS_SUB_A, MERCHANT], {
       amount: 9_900_000n, fee: 100_000n, charges_made: 2n, next_charge: 4_000_000_000n,
     }, "tx-c2"));
     // Plan 2: published but never subscribed to.
-    statsIx.apply(ev("plan_created", [MERCHANT, 2n], {
+    await statsIx.apply(ev("plan_created", [MERCHANT, 2n], {
       token: "C", amount: 5_000_000n, period: 2_592_000n, name: "Unused",
     }));
 
@@ -1147,41 +1270,41 @@ describe("subscriber upcoming charges", () => {
     const upEv = (name: string, topics: unknown[], data: Record<string, unknown>, tx: string): DecodedEvent => ({
       name, contractId: "C", ledger: 1, txHash: tx, topics, data,
     });
-    const sub = (id: number, subscriber: string, merchant: string, data: Record<string, unknown>): void => {
-      ix.apply(upEv("subscribed", [BigInt(id), subscriber, merchant], { plan_id: 1n, ...data }, `sub-${id}`));
+    const sub = async (id: number, subscriber: string, merchant: string, data: Record<string, unknown>): Promise<void> => {
+      await ix.apply(upEv("subscribed", [BigInt(id), subscriber, merchant], { plan_id: 1n, ...data }, `sub-${id}`));
     };
 
     // Due an hour ago: projected from now, not from the stale next_charge.
-    sub(101, DUE_SUB, M_DUE, {
+    await sub(101, DUE_SUB, M_DUE, {
       amount: 5_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW - 3_600), max_charges: 0n, fee_bps: 0n,
     });
     // First charge an hour out: the anchor is exactly its next_charge.
-    sub(102, FUTURE_SUB, M_FUTURE, {
+    await sub(102, FUTURE_SUB, M_FUTURE, {
       amount: 2_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 0n, fee_bps: 0n,
     });
     // One of two allowed charges already made: one remains.
-    sub(103, CAPPED_SUB, M_CAPPED, {
+    await sub(103, CAPPED_SUB, M_CAPPED, {
       amount: 1_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 2n, fee_bps: 0n,
     });
-    ix.apply(upEv("charged", [103n, CAPPED_SUB, M_CAPPED], {
+    await ix.apply(upEv("charged", [103n, CAPPED_SUB, M_CAPPED], {
       amount: 1_000_000n, fee: 0n, charges_made: 1n, next_charge: BigInt(UP_NOW + 3_600),
     }, "charge-103"));
     // Allowance used up: nothing more will ever be charged.
-    sub(104, SPENT_SUB, M_SPENT, {
+    await sub(104, SPENT_SUB, M_SPENT, {
       amount: 2_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 3_600), max_charges: 2n, fee_bps: 0n,
     });
-    ix.apply(upEv("charged", [104n, SPENT_SUB, M_SPENT], {
+    await ix.apply(upEv("charged", [104n, SPENT_SUB, M_SPENT], {
       amount: 2_000_000n, fee: 0n, charges_made: 2n, next_charge: BigInt(UP_NOW + 86_400),
     }, "charge-104"));
     // A 60s period over 30 days is 43,200 occurrences: the cap kicks in.
-    sub(105, FAST_SUB, M_FAST, {
+    await sub(105, FAST_SUB, M_FAST, {
       amount: 1_000n, period: 60n, next_charge: BigInt(UP_NOW + 60), max_charges: 0n, fee_bps: 0n,
     });
     // Two mandates with different rhythms, to check the merge order.
-    sub(106, MIXED_SUB, M_WEEKLY, {
+    await sub(106, MIXED_SUB, M_WEEKLY, {
       amount: 3_000_000n, period: 604_800n, next_charge: BigInt(UP_NOW + 100), max_charges: 0n, fee_bps: 0n,
     });
-    sub(107, MIXED_SUB, M_DAILY, {
+    await sub(107, MIXED_SUB, M_DAILY, {
       amount: 1_000_000n, period: 86_400n, next_charge: BigInt(UP_NOW + 200), max_charges: 0n, fee_bps: 0n,
     });
 
@@ -1383,7 +1506,7 @@ describe("express 5 error boundary", () => {
     }
   });
 
-  test("strips the caller's payload from the logged error", () => {
+  test("strips the caller's payload from the logged error", async () => {
     // body-parser hangs the raw request body off its error, and pino would
     // serialize it as an own enumerable property of `err`.
     const err = Object.assign(new SyntaxError("Unexpected end of JSON input"), {
@@ -1401,7 +1524,7 @@ describe("express 5 error boundary", () => {
     assert.ok(!(kept.stack ?? "").includes("do-not-log-me"));
   });
 
-  test("answers a fixed shape and never echoes the failure", () => {
+  test("answers a fixed shape and never echoes the failure", async () => {
     let code = 0;
     let sent: unknown;
     const res = {
@@ -1428,7 +1551,7 @@ describe("express 5 error boundary", () => {
     });
   });
 
-  test("hands back a response whose headers are already out", () => {
+  test("hands back a response whose headers are already out", async () => {
     let forwarded: unknown;
     const res = {
       headersSent: true,
@@ -1531,22 +1654,22 @@ describe("merchant churn", () => {
   };
 
   before(async () => {
-    churnIx.apply(ev("plan_created", [CHURN_MERCHANT, 1n], {
+    await churnIx.apply(ev("plan_created", [CHURN_MERCHANT, 1n], {
       token: "CTOKEN", amount: 10_000_000n, period: 2_592_000n, name: "p1",
     }, "tx-plan", JAN_END));
 
     // Mandate 1 starts in January and is cancelled in February.
-    churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+    await churnIx.apply(ev("subscribed", [1n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }, "tx-sub-1", JAN_END));
-    churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
+    await churnIx.apply(ev("cancelled", [1n, CHURN_SUBSCRIBER], { charges_made: 0 }, "tx-cancel-1", FEB_START));
 
     // Mandate 2 starts in February and is ended by the merchant, also in
     // February.
-    churnIx.apply(ev("subscribed", [2n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
+    await churnIx.apply(ev("subscribed", [2n, CHURN_SUBSCRIBER, CHURN_MERCHANT], {
       plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
     }, "tx-sub-2", FEB_MID));
-    churnIx.apply(ev("mandate_ended", [2n, CHURN_MERCHANT], {
+    await churnIx.apply(ev("mandate_ended", [2n, CHURN_MERCHANT], {
       subscriber: CHURN_SUBSCRIBER, charges_made: 1,
     }, "tx-end-2", FEB_MID));
 
@@ -2085,39 +2208,43 @@ describe("most popular plans", () => {
   const MERCHANT_B = testAddress(71);
   let api: Awaited<ReturnType<typeof serveDb>>;
 
-  type Plans = { plans: { id: number; merchantName: string | null }[]; nextCursor: string | null };
+  type Plans = {
+    plans: { id: number; merchantName: string | null; activeSubscribers: number }[];
+    nextCursor: string | null;
+  };
 
   before(async () => {
     const plan = (id: bigint, merchant: string) =>
       popIx.apply(ev("plan_created", [merchant, id], { token: "C", amount: 1_000n, period: 2_592_000n }, `plan-${id}`));
     let mandate = 0n;
     const subscriberOf = (id: bigint) => testAddress(80 + Number(id));
-    const subscribe = (planId: bigint, merchant: string) => {
+    const subscribe = async (planId: bigint, merchant: string, subscriber?: string) => {
       mandate += 1n;
-      popIx.apply(ev("subscribed", [mandate, subscriberOf(mandate), merchant], {
+      await popIx.apply(ev("subscribed", [mandate, subscriber ?? subscriberOf(mandate), merchant], {
         plan_id: planId, amount: 1_000n, period: 2_592_000n, next_charge: 4_000_000_000n,
       }, `sub-${mandate}`));
       return mandate;
     };
-    plan(1n, MERCHANT_A);
-    plan(2n, MERCHANT_A);
-    plan(3n, MERCHANT_A);
-    plan(4n, MERCHANT_B);
-    plan(5n, MERCHANT_B);
+    await plan(1n, MERCHANT_A);
+    await plan(2n, MERCHANT_A);
+    await plan(3n, MERCHANT_A);
+    await plan(4n, MERCHANT_B);
+    await plan(5n, MERCHANT_B);
     // Active mandates per plan: 1 → 1, 2 → 3, 3 → 1 (+1 cancelled),
     // 4 → 1 (+1 paused), 5 → 0 (1 cancelled).
-    subscribe(1n, MERCHANT_A);
-    subscribe(2n, MERCHANT_A);
-    subscribe(2n, MERCHANT_A);
-    subscribe(2n, MERCHANT_A);
-    subscribe(3n, MERCHANT_A);
-    const cancelled3 = subscribe(3n, MERCHANT_A);
-    subscribe(4n, MERCHANT_B);
-    const paused4 = subscribe(4n, MERCHANT_B);
-    const cancelled5 = subscribe(5n, MERCHANT_B);
-    popIx.apply(ev("cancelled", [cancelled3, subscriberOf(cancelled3)], {}, "cancel-3"));
-    popIx.apply(ev("cancelled", [cancelled5, subscriberOf(cancelled5)], {}, "cancel-5"));
-    popIx.apply(ev("pause_changed", [paused4, subscriberOf(paused4)], { paused: true }, "pause-4"));
+    await subscribe(1n, MERCHANT_A);
+    const sameSubscriber = testAddress(79);
+    await subscribe(2n, MERCHANT_A, sameSubscriber);
+    await subscribe(2n, MERCHANT_A, sameSubscriber);
+    await subscribe(2n, MERCHANT_A);
+    await subscribe(3n, MERCHANT_A);
+    const cancelled3 = await subscribe(3n, MERCHANT_A);
+    await subscribe(4n, MERCHANT_B);
+    const paused4 = await subscribe(4n, MERCHANT_B);
+    const cancelled5 = await subscribe(5n, MERCHANT_B);
+    await popIx.apply(ev("cancelled", [cancelled3, subscriberOf(cancelled3)], {}, "cancel-3"));
+    await popIx.apply(ev("cancelled", [cancelled5, subscriberOf(cancelled5)], {}, "cancel-5"));
+    await popIx.apply(ev("pause_changed", [paused4, subscriberOf(paused4)], { paused: true }, "pause-4"));
     api = await serveDb(popDb);
   });
 
@@ -2126,13 +2253,24 @@ describe("most popular plans", () => {
     popDb.close();
   });
 
-  test("ranks plans by active mandates, ties broken by plan id", async () => {
+  test("returns active subscriber counts and ranks by distinct subscribers", async () => {
     const { status, body } = await api.get<Plans>("/api/plans?sort=subscribers");
     assert.equal(status, 200);
-    // Plans 1, 3 and 4 tie at one active mandate; cancelled and paused
-    // mandates do not count, so plan 5 ranks last with none.
+    // Plan 2 has three active mandates but two distinct subscribers. Plans
+    // 1, 3 and 4 tie at one; cancelled and paused mandates do not count.
     assert.deepEqual(body.plans.map((p) => p.id), [2, 1, 3, 4, 5]);
+    assert.deepEqual(body.plans.map((p) => p.activeSubscribers), [2, 1, 1, 1, 0]);
     assert.equal(body.nextCursor, null);
+
+    const plan = await api.get<{ activeSubscribers: number }>("/api/plans/2");
+    assert.equal(plan.status, 200);
+    assert.equal(plan.body.activeSubscribers, 2, "plan detail uses the same maintained count");
+  });
+
+  test("plan counts are available without authentication", async () => {
+    const { status, body } = await api.get<Plans>("/api/plans");
+    assert.equal(status, 200);
+    assert.ok(body.plans.every((plan) => Number.isInteger(plan.activeSubscribers)));
   });
 
   test("honours limit and the merchant filter", async () => {
@@ -2143,9 +2281,10 @@ describe("most popular plans", () => {
     assert.deepEqual(merchantB.body.plans.map((p) => p.id), [4, 5]);
   });
 
-  test("without sort the order is still newest first", async () => {
+  test("without sort the order is still newest first and includes counts", async () => {
     const { body } = await api.get<Plans>("/api/plans");
     assert.deepEqual(body.plans.map((p) => p.id), [5, 4, 3, 2, 1]);
+    assert.deepEqual(body.plans.map((p) => p.activeSubscribers), [0, 1, 1, 2, 1]);
   });
 
   test("a cursor cannot be combined with the ranking", async () => {
@@ -2248,7 +2387,7 @@ describe("merchant unpaid report", () => {
     }[];
   };
 
-  const subscribe = (
+  const subscribe = async (
     ix: Indexer,
     id: bigint,
     subscriber: string,
@@ -2260,31 +2399,31 @@ describe("merchant unpaid report", () => {
     ix.apply(ev("subscribed", [id, subscriber, merchant], {
       plan_id: planId, amount, period: 2_592_000n, next_charge: BigInt(nextCharge),
     }, `sub-${id}`));
-  const deposit = (ix: Indexer, subscriber: string, token: string, balance: bigint, tx: string) =>
+  const deposit = async (ix: Indexer, subscriber: string, token: string, balance: bigint, tx: string) =>
     ix.apply(ev("deposit", [subscriber, token], { amount: balance, balance }, tx));
 
   before(async () => {
-    unpaidIx.apply(ev("plan_created", [MERCHANT_U, 1n], { token: "CTOKEN", amount: 1n, period: 2_592_000n }, "plan-1"));
-    unpaidIx.apply(ev("plan_created", [MERCHANT_O, 2n], { token: "CTOKEN", amount: 1n, period: 2_592_000n }, "plan-2"));
+    await unpaidIx.apply(ev("plan_created", [MERCHANT_U, 1n], { token: "CTOKEN", amount: 1n, period: 2_592_000n }, "plan-1"));
+    await unpaidIx.apply(ev("plan_created", [MERCHANT_O, 2n], { token: "CTOKEN", amount: 1n, period: 2_592_000n }, "plan-2"));
     // 1: due an hour, the vault holds 4 of the 10 it needs → unpaid.
-    subscribe(unpaidIx, 1n, S1, MERCHANT_U, 1n, 10_000_000n, NOW - 3_600);
-    deposit(unpaidIx, S1, "CTOKEN", 4_000_000n, "dep-1");
+    await subscribe(unpaidIx, 1n, S1, MERCHANT_U, 1n, 10_000_000n, NOW - 3_600);
+    await deposit(unpaidIx, S1, "CTOKEN", 4_000_000n, "dep-1");
     // 2: due a day, nothing indexed for the subscriber → unpaid, balance 0.
-    subscribe(unpaidIx, 2n, S2, MERCHANT_U, 1n, 5_000_000n, NOW - 86_400);
+    await subscribe(unpaidIx, 2n, S2, MERCHANT_U, 1n, 5_000_000n, NOW - 86_400);
     // 3: due, covered by the vault → funded, not in the report.
-    subscribe(unpaidIx, 3n, S3, MERCHANT_U, 1n, 1_000_000n, NOW - 7_200);
-    deposit(unpaidIx, S3, "CTOKEN", 2_000_000n, "dep-3");
+    await subscribe(unpaidIx, 3n, S3, MERCHANT_U, 1n, 1_000_000n, NOW - 7_200);
+    await deposit(unpaidIx, S3, "CTOKEN", 2_000_000n, "dep-3");
     // 4: not due yet.
-    subscribe(unpaidIx, 4n, S1, MERCHANT_U, 1n, 99_000_000n, NOW + 3_600);
+    await subscribe(unpaidIx, 4n, S1, MERCHANT_U, 1n, 99_000_000n, NOW + 3_600);
     // 5: another merchant's unpaid mandate.
-    subscribe(unpaidIx, 5n, S2, MERCHANT_O, 2n, 5_000_000n, NOW - 86_400);
+    await subscribe(unpaidIx, 5n, S2, MERCHANT_O, 2n, 5_000_000n, NOW - 86_400);
     // 6: due as long as mandate 2; the balance is in another token, which
     // does not pay this plan → unpaid, tied with 2 on time overdue.
-    subscribe(unpaidIx, 6n, S4, MERCHANT_U, 1n, 3_000_000n, NOW - 86_400);
-    deposit(unpaidIx, S4, "COTHER", 50_000_000n, "dep-6");
+    await subscribe(unpaidIx, 6n, S4, MERCHANT_U, 1n, 3_000_000n, NOW - 86_400);
+    await deposit(unpaidIx, S4, "COTHER", 50_000_000n, "dep-6");
     // 7: due and unfunded, but cancelled → no longer chargeable.
-    subscribe(unpaidIx, 7n, S5, MERCHANT_U, 1n, 3_000_000n, NOW - 86_400);
-    unpaidIx.apply(ev("cancelled", [7n, S5], {}, "cancel-7"));
+    await subscribe(unpaidIx, 7n, S5, MERCHANT_U, 1n, 3_000_000n, NOW - 86_400);
+    await unpaidIx.apply(ev("cancelled", [7n, S5], {}, "cancel-7"));
     api = await serveDb(unpaidDb);
   });
 
@@ -2350,10 +2489,10 @@ describe("merchant unpaid report", () => {
     // 250 funded mandates fall due first, so the unpaid ones sit past the
     // first page of the walk; the two unpaid ones tie on next_charge.
     for (let i = 1; i <= 250; i += 1) {
-      subscribe(pageIx, BigInt(i), RICH, MERCHANT_U, 1n, 1n, NOW - 100_000 + i);
+      await subscribe(pageIx, BigInt(i), RICH, MERCHANT_U, 1n, 1n, NOW - 100_000 + i);
     }
-    subscribe(pageIx, 251n, BROKE, MERCHANT_U, 1n, 1n, NOW - 10);
-    subscribe(pageIx, 252n, BROKE, MERCHANT_U, 1n, 1n, NOW - 10);
+    await subscribe(pageIx, 251n, BROKE, MERCHANT_U, 1n, 1n, NOW - 10);
+    await subscribe(pageIx, 252n, BROKE, MERCHANT_U, 1n, 1n, NOW - 10);
     const paged = await serveDb(pageDb);
     try {
       const { body } = await paged.get<Unpaid>(`/api/merchants/${MERCHANT_U}/unpaid`);

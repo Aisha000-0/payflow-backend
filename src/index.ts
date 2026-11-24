@@ -1,5 +1,7 @@
+import { Server } from "node:http";
 import { loadConfig, networkConfigs } from "./config.ts";
-import { openDatabase } from "./lib/db.ts";
+import { openStorage } from "./lib/store/index.ts";
+import { pruneOldEvents, pruneChargeAttempts, getPastDueMandates as getPastDueMandatesFromDb, logAuditEvent } from "./lib/db.ts";
 import { acquireLock } from "./lib/lock.ts";
 import { HttpArchive, makeRpc } from "./lib/stellar.ts";
 import { makeSimulationReader, TokenMetadataService } from "./lib/tokens.ts";
@@ -7,6 +9,10 @@ import { WebhookDispatcher } from "./lib/webhooks.ts";
 import { sep10For } from "./routes/auth.ts";
 import { createApp } from "./app.ts";
 import { Indexer } from "./indexer.ts";
+import { createCache } from "./lib/cache.ts";
+import { MerchantSummaryCache } from "./routes/merchants.ts";
+import type { TokenMetadata } from "./routes/types.ts";
+import type { MerchantSummary } from "./routes/types.ts";
 import { Keeper } from "./keeper.ts";
 import type { AdminHooks } from "./routes/admin.ts";
 import { logger } from "./lib/logger.ts";
@@ -16,21 +22,36 @@ import { initTelemetry, withSpan } from "./lib/telemetry.ts";
 
 const config = loadConfig();
 const stopTelemetry = initTelemetry(config.OTEL_EXPORTER_OTLP_ENDPOINT);
+
+// Each component can be opted out of so the API, the indexer and the keeper
+// run as independent processes (one process, one responsibility). All three
+// run by default, which preserves the current single-process behaviour.
+const runApi = process.env.RUN_API !== "false";
+const runIndexer = process.env.RUN_INDEXER !== "false";
+const runKeeperEnv = process.env.RUN_KEEPER !== "false";
 const networks = networkConfigs(config);
 
 // One indexer and one database per network, so cursors and projections never
 // mix. `runtimes[0]` is the default network: it serves the unprefixed routes.
-const runtimes = networks.map((network) => {
+const runtimes = await Promise.all(networks.map(async (network) => {
   // Mark the database as in use so `npm run reindex` refuses to move it away
-  // underneath us; a second server on the same file fails here too.
-  const releaseLock = acquireLock(network.databasePath);
-  const db = openDatabase(network.databasePath);
+  // underneath us; a second indexer on the same file fails here too. Only the
+  // process that runs the indexer takes the lock, and only for a file-backed
+  // database: an API-only or keeper-only process, or a Postgres-backed store,
+  // shares it (SQLite WAL serialises their writes).
+  const releaseLock =
+    runIndexer && !network.databaseUrl ? acquireLock(network.databasePath) : undefined;
+  const db = await openStorage(network);
   const server = makeRpc(network);
   // A full-history archive backfills the gap between the stored cursor and
   // the oldest ledger the RPC still serves, so an outage longer than RPC
   // retention does not silently shrink the projection.
   const archive = network.archiveUrl ? new HttpArchive(network.archiveUrl) : undefined;
-  const indexer = new Indexer(db, server, network, undefined, archive);
+  const summaryCache = new MerchantSummaryCache(
+    createCache<MerchantSummary>(config.REDIS_URL, `payflow:${network.name}:merchant-summary`),
+  );
+  const tokenCache = createCache<TokenMetadata>(config.REDIS_URL, `payflow:${network.name}:token`);
+  const indexer = new Indexer(db, server, network, summaryCache, archive);
   const dispatcher = new WebhookDispatcher({
     db,
     events: indexer.events,
@@ -56,7 +77,7 @@ const runtimes = networks.map((network) => {
   // RPC failover the indexer uses, cached by contract id (see lib/tokens.ts).
   const tokens = new TokenMetadataService(
     makeSimulationReader(server, network.networkPassphrase),
-    { networkPassphrase: network.networkPassphrase },
+    { networkPassphrase: network.networkPassphrase, store: tokenCache },
   );
   // Re-reads a sample of active mandates from the contract and repairs any
   // drift the indexer missed (RPC gap, bug, outage mid-range).
@@ -68,21 +89,25 @@ const runtimes = networks.map((network) => {
     config.RECONCILE_SAMPLE_SIZE,
     // A repaired mandate changes the merchant's summary; evict it so the API
     // serves the corrected projection instead of a stale cache entry.
-    (merchant) => indexer.merchantCache.invalidate(merchant),
+    (merchant) => { void indexer.merchantCache.invalidate(merchant); },
   );
   // SEP-10 sign-in reads the signing account's signers through the same RPC.
   const auth = sep10For(config, network, server);
-  return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth };
-});
+  return { network, db, releaseLock, server, indexer, runPass, tokens, reconciler, dispatcher, auth, summaryCache, tokenCache };
+}));
 const defaultRuntime = runtimes[0]!;
 // Release the database locks however the process ends; a crash that skips
 // this leaves a stale lock, which the next taker detects by its dead PID.
 process.on("exit", () => {
-  for (const rt of runtimes) rt.releaseLock();
+  for (const rt of runtimes) rt.releaseLock?.();
 });
 
+// A mandate's failing and recovered streaks reach the merchant's webhooks on
+// the same network the keeper settles.
 const keeper = config.KEEPER_ENABLED
-  ? new Keeper(defaultRuntime.db, defaultRuntime.server, config)
+  ? new Keeper(defaultRuntime.db, defaultRuntime.server, config, (event) =>
+      defaultRuntime.dispatcher.onChargeStreak(event),
+    )
   : undefined;
 const activeKeeper = keeper;
 if (keeper) {
@@ -116,103 +141,190 @@ const runKeeperPass = keeper
 
 const adminHooks: AdminHooks = {
   reindex: async () => {
-    const results = await Promise.all(runtimes.map((rt) => rt.runPass()));
-    return results[0]!;
+    const db = defaultRuntime.db;
+    try {
+      const results = await Promise.all(runtimes.map((rt) => rt.runPass()));
+      await logAuditEvent(db, {
+        action: "reindex",
+        success: true,
+        details: { cursor: results[0]?.cursor },
+      });
+      return results[0]!;
+    } catch (err) {
+      await logAuditEvent(db, {
+        action: "reindex",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   },
   // Runtime indexer control: hold every network's loop back without taking the
   // API down. While paused, each tick is a no-op, so the cursor and projection
   // are preserved and /health reports `indexer.paused: true`.
-  pauseIndexer: () => {
+  pauseIndexer: async () => {
+    const db = defaultRuntime.db;
     for (const rt of runtimes) rt.indexer.pause();
+    await logAuditEvent(db, {
+      action: "indexer_paused",
+      success: true,
+    });
     return null;
   },
-  resumeIndexer: () => {
+  resumeIndexer: async () => {
+    const db = defaultRuntime.db;
     for (const rt of runtimes) rt.indexer.resume();
+    await logAuditEvent(db, {
+      action: "indexer_resumed",
+      success: true,
+    });
     return null;
+  },
+  pruneData: async (daysToKeep?: number) => {
+    const db = defaultRuntime.db;
+    // Per-table retention: `daysToKeep` is an operator override for raw events
+    // from the admin endpoint; if absent, use the per-table config defaults.
+    const rawEventDays = daysToKeep ?? (config.RAW_EVENT_RETENTION_DAYS ?? config.DATA_RETENTION_DAYS);
+    const chargeAttemptDays = config.CHARGE_ATTEMPT_RETENTION_DAYS;
+    try {
+      const events = await pruneOldEvents(db, rawEventDays);
+      const chargeAttempts = await pruneChargeAttempts(db, chargeAttemptDays);
+      const deleted = { events, chargeAttempts };
+      await logAuditEvent(db, {
+        action: "data_pruned",
+        details: { deleted, rawEventDays, chargeAttemptDays },
+        success: true,
+      });
+      return { deleted };
+    } catch (err) {
+      await logAuditEvent(db, {
+        action: "data_pruned",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+        details: { rawEventDays, chargeAttemptDays },
+      });
+      throw err;
+    }
+  },
+  getAuditLogs: async (limit: number) => {
+    const db = defaultRuntime.db;
+    return db.all(
+      `SELECT id, action, subject, details, success, error_msg as errorMsg,
+        created_at as createdAt FROM audit_logs ORDER BY created_at DESC LIMIT ?`,
+      [limit],
+    );
+  },
+  getPastDueMandates: async () => {
+    const db = defaultRuntime.db;
+    return getPastDueMandatesFromDb(db);
   },
 };
 if (keeper && runKeeperPass) {
-  adminHooks.keeperPass = () => runKeeperPass();
+  adminHooks.keeperPass = async () => {
+    const db = defaultRuntime.db;
+    try {
+      const result = await runKeeperPass();
+      const settled = (result as unknown[]).filter((r: unknown) => (r as { status: string }).status === "settled").length;
+      await logAuditEvent(db, {
+        action: "keeper_pass",
+        success: true,
+        details: { settled, attempted: result.length },
+      });
+      return result;
+    } catch (err) {
+      await logAuditEvent(db, {
+        action: "keeper_pass",
+        success: false,
+        errorMsg: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
+  };
   adminHooks.keeperBackoff = () => keeper.backoffList();
   adminHooks.keeperHistory = () => keeper.passHistory();
 }
 
-const app = createApp(
-  runtimes.map((rt) => ({
-    config: rt.network,
-    db: rt.db,
-    events: rt.indexer.events,
-    indexer: rt.indexer.status,
-    summaryCache: rt.indexer.merchantCache,
-    rpc: rt.server,
-    tokens: rt.tokens,
-    webhooks: rt.dispatcher,
-    auth: rt.auth,
-  })),
-  config,
-  adminHooks,
-);
-
-const http = app.listen(config.PORT, () => {
-  logger.info(
-    { port: config.PORT, networks: networks.map((n) => n.name) },
-    "api listening",
+let http: Server | undefined;
+if (runApi) {
+  const app = createApp(
+    runtimes.map((rt) => ({
+      config: rt.network,
+      db: rt.db,
+      events: rt.indexer.events,
+      indexer: rt.indexer.status,
+      summaryCache: rt.summaryCache,
+      rpc: rt.server,
+      tokens: rt.tokens,
+      webhooks: rt.dispatcher,
+      auth: rt.auth,
+    })),
+    config,
+    adminHooks,
   );
-});
+
+  http = app.listen(config.PORT, () => {
+    logger.info(
+      { port: config.PORT, networks: networks.map((n) => n.name) },
+      "api listening",
+    );
+  });
+}
 
 const loops: Loop[] = [];
 
-for (const rt of runtimes) {
-  loops.push(
-    every(config.INDEXER_INTERVAL_MS, async () => {
-      try {
-        await rt.runPass();
-      } catch {
-        // Handled in runPass
-      }
-    }),
-  );
-  loops.push(
-    every(config.RECONCILE_INTERVAL_MS, async () => {
-      try {
-        const r = await rt.reconciler.tick();
-        rt.indexer.status.reconciliations = (rt.indexer.status.reconciliations ?? 0) + 1;
-        rt.indexer.status.corrections = (rt.indexer.status.corrections ?? 0) + r.corrections;
-        if (r.errors > 0) {
-          logger.warn(
-            {
-              network: rt.network.name,
-              sampled: r.sampled,
-              onChain: r.onChain,
-              errors: r.errors,
-              lastError: r.lastError,
-            },
-            "reconcile pass had failures",
-          );
+if (runIndexer) {
+  for (const rt of runtimes) {
+    loops.push(
+      every(config.INDEXER_INTERVAL_MS, async () => {
+        try {
+          await rt.runPass();
+        } catch {
+          // Handled in runPass
         }
-        if (r.corrections > 0) {
-          logger.info(
-            { network: rt.network.name, corrections: r.corrections, sampled: r.sampled },
-            "reconcile pass corrected drift",
-          );
+      }),
+    );
+    loops.push(
+      every(config.RECONCILE_INTERVAL_MS, async () => {
+        try {
+          const r = await rt.reconciler.tick();
+          rt.indexer.status.reconciliations = (rt.indexer.status.reconciliations ?? 0) + 1;
+          rt.indexer.status.corrections = (rt.indexer.status.corrections ?? 0) + r.corrections;
+          if (r.errors > 0) {
+            logger.warn(
+              {
+                network: rt.network.name,
+                sampled: r.sampled,
+                onChain: r.onChain,
+                errors: r.errors,
+                lastError: r.lastError,
+              },
+              "reconcile pass had failures",
+            );
+          }
+          if (r.corrections > 0) {
+            logger.info(
+              { network: rt.network.name, corrections: r.corrections, sampled: r.sampled },
+              "reconcile pass corrected drift",
+            );
+          }
+        } catch {
+          // Reconciler.tick logs and swallows its own failures; this is defensive.
         }
-      } catch {
-        // Reconciler.tick logs and swallows its own failures; this is defensive.
-      }
-    }),
-    // Retry undelivered webhooks on their own cadence so a slow or silent
-    // indexer loop still makes delivery progress.
-    every(5_000, async () => {
-      try {
-        await rt.dispatcher.retryDue(Math.floor(Date.now() / 1000));
-      } catch {
-        // retryDue logs its own failures; the loop keeps going.
-      }
-    }),
-  );
+      }),
+      // Retry undelivered webhooks on their own cadence so a slow or silent
+      // indexer loop still makes delivery progress.
+      every(5_000, async () => {
+        try {
+          await rt.dispatcher.retryDue(Math.floor(Date.now() / 1000));
+        } catch {
+          // retryDue logs its own failures; the loop keeps going.
+        }
+      }),
+    );
+  }
 }
 
-if (runKeeperPass) {
+if (runKeeperEnv && runKeeperPass) {
   loops.push(
     every(config.KEEPER_INTERVAL_MS, async () => {
       try {
@@ -261,13 +373,28 @@ async function shutdown(signal: string): Promise<void> {
   const outcome = await drain(loops, config.SHUTDOWN_TIMEOUT_MS);
   if (outcome === "timeout") logger.warn({ timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "passes still running; closing anyway");
   await stopTelemetry().catch(() => {});
-  http.close(() => {
-    for (const rt of runtimes) {
-      rt.db.close();
-      rt.releaseLock();
-    }
+  const closeAll = async () => {
+    await Promise.all(
+      runtimes.map(async (rt) => {
+        await rt.summaryCache.clear().catch(() => undefined);
+        await rt.tokenCache.close().catch(() => undefined);
+        const summaryStore = (rt.summaryCache as unknown as { store?: { close?: () => Promise<void> } }).store;
+        await summaryStore?.close?.().catch(() => undefined);
+        await rt.db.close();
+        rt.releaseLock?.();
+      }),
+    );
+  };
+  // `http` is only started when this process serves the API (RUN_API); an
+  // indexer-only or keeper-only process closes the stores directly.
+  if (http) {
+    http.close(() => {
+      void closeAll().then(() => process.exit(0));
+    });
+  } else {
+    await closeAll();
     process.exit(0);
-  });
+  }
 }
 
 process.on("SIGTERM", () => void shutdown("SIGTERM"));

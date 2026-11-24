@@ -36,7 +36,8 @@
 import { pathToFileURL } from "node:url";
 import type { DatabaseSync } from "node:sqlite";
 import { networkConfigs, loadConfig, type Config, type NetworkConfig } from "../config.ts";
-import { openDatabase, readCursor, writeCursor } from "../lib/db.ts";
+import { openDatabase, readCursor, writeCursor, backupDatabase } from "../lib/db.ts";
+import { asStorage } from "../lib/store/index.ts";
 import { HttpArchive, makeRpc, type RpcLike } from "../lib/stellar.ts";
 import {
   countDueMandates,
@@ -264,6 +265,18 @@ const COMMAND_LIST: CommandSpec[] = [
       "leaves. --skip-ahead accepts it.",
     ],
   },
+  {
+    name: "backup",
+    summary: "Back up the SQLite database to a file",
+    usage: "backup <path>",
+    positionals: [{ name: "<path>", description: "Destination file for the backup" }],
+    options: [],
+    notes: [
+      "Writes a transactionally consistent snapshot of the database to",
+      "`<path>` using SQLite's VACUUM INTO. The running service keeps serving",
+      "requests while the backup is taken.",
+    ],
+  },
 ];
 
 /** The commands by name. */
@@ -480,8 +493,9 @@ async function statusCommand(context: CommandContext): Promise<number> {
   const openDb = deps.openDb ?? openDatabase;
   const db = openDb(databasePath(context.network, args.options));
   try {
-    const stats = getProtocolStats(db, context.now - 86_400);
-    const due = countDueMandates(db, context.now);
+    const storage = asStorage(db);
+    const stats = await getProtocolStats(storage, context.now - 86_400);
+    const due = await countDueMandates(storage, context.now);
     const cursor = stats.lastIndexedLedger;
 
     let latest: number | null = null;
@@ -767,19 +781,20 @@ async function probeApi(url: string): Promise<{
  *
  * Reads the projection only: no RPC call, no transaction.
  */
-function mandateCommand(context: CommandContext): Promise<number> {
+async function mandateCommand(context: CommandContext): Promise<number> {
   const { deps, args, write } = context;
   const id = positiveInt(context.args.positionals[0] ?? "", "the mandate id");
   const openDb = deps.openDb ?? openDatabase;
   const db = openDb(databasePath(context.network, args.options));
   try {
-    const mandate = getMandateById(db, id);
+    const storage = asStorage(db);
+    const mandate = await getMandateById(storage, id);
     if (!mandate) {
       throw new CliError(`no mandate ${id} in the ${context.network.name} projection`);
     }
-    const token = planTokensByIds(db, [mandate.plan_id]).get(mandate.plan_id) ?? null;
+    const token = (await planTokensByIds(storage, [mandate.plan_id])).get(mandate.plan_id) ?? null;
     const limit = boundedInt(optionValue(args.options, "limit"), "--limit", 10, MAX_LIMIT);
-    const charges = listMandateCharges(db, id, limit);
+    const charges = await listMandateCharges(storage, id, limit);
 
     const payload = {
       network: context.network.name,
@@ -831,15 +846,16 @@ function mandateCommand(context: CommandContext): Promise<number> {
  * The same rows the API's `/due` returns: the projection's due mandates,
  * each with the `funded` flag the last indexed vault balance gives.
  */
-function dueCommand(context: CommandContext): Promise<number> {
+async function dueCommand(context: CommandContext): Promise<number> {
   const { deps, args, write } = context;
   const openDb = deps.openDb ?? openDatabase;
   const db = openDb(databasePath(context.network, args.options));
   try {
     const limit = boundedInt(optionValue(args.options, "limit"), "--limit", 50, MAX_LIMIT);
-    const rows = listDueMandates(db, context.now, limit);
-    const tokens = planTokensByIds(db, rows.map((row) => row.plan_id));
-    const balances = listLatestVaultBalances(db, rows.map((row) => row.subscriber));
+    const storage = asStorage(db);
+    const rows = await listDueMandates(storage, context.now, limit);
+    const tokens = await planTokensByIds(storage, rows.map((row) => row.plan_id));
+    const balances = await listLatestVaultBalances(storage, rows.map((row) => row.subscriber));
 
     const due = rows.map((row) => {
       const token = tokens.get(row.plan_id);
@@ -904,7 +920,7 @@ async function chargeCommand(context: CommandContext): Promise<number> {
   const db = openDb(databasePath(context.network, args.options));
   const asJson = flag(args.options, "json");
   try {
-    const mandate = getMandateById(db, id);
+    const mandate = await getMandateById(asStorage(db), id);
     if (!mandate) {
       throw new CliError(`no mandate ${id} in the ${context.network.name} projection`);
     }
@@ -1032,6 +1048,20 @@ async function reindexCommand(context: CommandContext): Promise<number> {
   }
 }
 
+async function backupCommand(context: CommandContext): Promise<number> {
+  const { deps, args, write } = context;
+  const openDb = deps.openDb ?? openDatabase;
+  const db = openDb(databasePath(context.network, args.options));
+  try {
+    const path = args.positionals[0] as string;
+    backupDatabase(db, path);
+    write(`backed up ${context.network.name} to ${path}`);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
 /** Run one command. */
 async function runCommand(context: CommandContext): Promise<number> {
   switch (context.spec.name) {
@@ -1045,6 +1075,8 @@ async function runCommand(context: CommandContext): Promise<number> {
       return chargeCommand(context);
     case "reindex":
       return reindexCommand(context);
+    case "backup":
+      return backupCommand(context);
     default:
       throw new CliError(`unknown command '${context.spec.name}'`);
   }

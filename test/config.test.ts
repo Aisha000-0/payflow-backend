@@ -79,6 +79,14 @@ describe("keeper order", () => {
   });
 });
 
+describe("metrics configuration", () => {
+  test("is disabled by default and accepts the explicit opt-in", () => {
+    assert.equal(loadConfig({ ...BASE }).METRICS_ENABLED, false);
+    assert.equal(loadConfig({ ...BASE, METRICS_ENABLED: "true" }).METRICS_ENABLED, true);
+    assert.equal(loadConfig({ ...BASE, METRICS_ENABLED: "false" }).METRICS_ENABLED, false);
+  });
+});
+
 describe("keeper merchants", () => {
   const A = Keypair.random().publicKey();
   const B = Keypair.random().publicKey();
@@ -202,6 +210,29 @@ describe("network configs", () => {
     assert.equal(networks[0]!.databasePath, "./payflow.db");
   });
 
+  test("DATABASE_URL selects PostgreSQL for every configured network", () => {
+    const overrides = {
+      DATABASE_URL: "postgres://payflow:secret@db.example/payflow",
+      NETWORKS: "mainnet",
+      MAINNET_SOROBAN_RPC_URL: "https://mainnet.sorobanrpc.example",
+      MAINNET_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
+      MAINNET_PLAN_REGISTRY_ID: VALID_CONTRACT_ID,
+      MAINNET_VAULT_ID: VALID_CONTRACT_ID,
+      MAINNET_SUBSCRIPTION_ID: VALID_CONTRACT_ID,
+    };
+    const config = loadConfig({ ...BASE, ...overrides });
+    const networks = networkConfigs(config, { ...BASE, ...overrides });
+    assert.deepEqual(networks.map((network) => network.databaseUrl), [overrides.DATABASE_URL, overrides.DATABASE_URL]);
+  });
+
+  test("DATABASE_URL must use PostgreSQL protocol", () => {
+    assert.throws(
+      () => loadConfig({ ...BASE, DATABASE_URL: "https://db.example/payflow" }),
+      /DATABASE_URL: must use a postgres URL/,
+    );
+    assert.equal(loadConfig({ ...BASE, DATABASE_URL: "" }).DATABASE_URL, undefined);
+  });
+
   test("an extra network is built from its prefixed variables", () => {
     const overrides = {
       NETWORKS: "mainnet",
@@ -222,6 +253,14 @@ describe("network configs", () => {
     assert.equal(mainnet.startLedger, 5_110_418);
     // The default path is a template so both databases sit side by side.
     assert.equal(mainnet.databasePath, "/data/payflow-mainnet.db");
+  });
+
+  test("every network carries the indexer progress cadence, 10,000 ledgers by default", () => {
+    assert.equal(loadConfig(env()).INDEXER_PROGRESS_LEDGERS, 10_000);
+    assert.equal(networkConfigs(loadConfig(env()), env())[0]!.progressLedgers, 10_000);
+    const overrides = { INDEXER_PROGRESS_LEDGERS: "0" };
+    assert.equal(networkConfigs(loadConfig(env(overrides)), env(overrides))[0]!.progressLedgers, 0);
+    assert.throws(() => loadConfig(env({ INDEXER_PROGRESS_LEDGERS: "-1" })), /INDEXER_PROGRESS_LEDGERS/);
   });
 
   test("naming the default network in NETWORKS does not duplicate it", () => {

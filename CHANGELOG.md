@@ -7,6 +7,38 @@ All notable changes to payflow-backend. The format follows
 ## [Unreleased]
 
 ### Added
+- **A versioned API (#173).** Every route is served under `/api/v1/...` and
+  `/api/...` remains an alias, mounted from the same router, so an existing
+  client keeps working and a breaking change lands in the next version. The
+  OpenAPI document lists both surfaces, and the typed client calls `/api/v1`.
+- **A consumer schema artifact (#174).** `npm run schema` writes the OpenAPI
+  3.1 document to `api-schema.json` and CI publishes it as the `api-schema`
+  artifact. `test/consumer.test.ts` validates the golden response fixtures
+  against the documented response schemas, so the published contract and the
+  responses the tests see cannot drift apart.
+- **A dev container (#176).** `.devcontainer/` uses Node 22, runs `npm ci`,
+  installs the Stellar CLI and recommends the project's editor extensions, so
+  a Codespace needs no host setup.
+- **A readable API reference (#162).** `GET /api/docs` renders the OpenAPI
+  document with ReDoc. The page, its bootstrap and the ReDoc bundle are all
+  served by the service, so the reference works offline with no third-party
+  CDN. The CSP is widened only with `worker-src 'self' blob:` for ReDoc's
+  search worker; every other directive stays helmet's default.
+- **The typed client as a standalone npm package (#163).**
+  `@mmm-pay/payflow-client` is built from the same response types as the
+  backend and has no runtime dependencies. It keeps its own version and
+  changelog under `client/`, and `client-v*` releases publish it with npm
+  provenance.
+- **A mandate's charges can be filtered by date (#164).**
+  `GET /api/mandates/:id/charges` accepts `from` and `to`, as unix seconds or
+  ISO 8601 dates (a date covers its whole UTC day), and returns only charges
+  whose ledger close time falls in the inclusive range. A `from` after `to` is
+  `400 invalid_request`, and the filter is served by a
+  `(mandate_id, created_at)` index.
+- **A subscriber's payments can be exported as CSV (#165).**
+  `GET /api/subscribers/:address/charges.csv` streams every settled charge
+  oldest first, with date, merchant, plan, amount, fee and tx hash. Amounts
+  are decimal strings in token units, and `from`/`to` bound the range.
 - **Protocol fee revenue over time (#149).** `GET /api/protocol/fees` sums
   charge fees per `day`, `week` or `month` bucket of ledger close time,
   reading only the requested window through a covering index on
@@ -238,8 +270,34 @@ All notable changes to payflow-backend. The format follows
   `test/replay.test.ts` replays them through `decodeEvent` and the projection,
   asserts the resulting database state matches a committed snapshot, and proves
   that replaying the fixture twice leaves the database unchanged.
+- **Structured indexer progress every N ledgers (#359).** Each time the cursor
+  moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000; `0` turns it off)
+  the indexer logs one `indexer progress` line with the network, cursor,
+  latest ledger, how far behind it is, the ledgers and events since the last
+  line and the rate in ledgers per second, so a long catch-up shows movement
+  even through ranges with no events.
+- **The typed client reads charge attempts (#363).** The keeper already
+  records every attempt with its outcome and reason in `charge_attempts`
+  (#144); `PayflowClient.chargeAttempts` now reads them from
+  `GET /api/v1/mandates/:id/attempts`, and the route is listed in the README.
+- **A threat model for the public API (#360).** `docs/THREAT_MODEL.md`
+  describes the assets, actors and trust boundaries, every entry point with
+  how it authenticates, the merchant, SEP-10 and operator authorization
+  model, the controls in place, and fifteen known risks with the code they
+  live in and what contains them. It is linked from the README and
+  SECURITY.md.
 
 ### Changed
+
+- **The raw event feed reads one page per request (#364).** `GET /api/events`
+  without a `name` filter now asks the database for one page plus one row
+  (51) instead of a 200-row batch, and a `contract` filter is served by a new
+  `(contract_id, ledger, event_id)` index, created on startup for SQLite and
+  PostgreSQL alike, instead of walking every contract's events from the
+  cursor. On 200,000 events, a page for a contract with 50 of them went from a
+  91 ms parallel sequential scan to a 0.24 ms index scan on PostgreSQL 16, and
+  from 99 ms to 5 ms through the route on SQLite. Responses, page sizes and
+  cursors are unchanged.
 
 - **The indexer's idempotency is tested under random orderings (#48).** The
   projection was checked against a handful of hand-written replays. A seeded

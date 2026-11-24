@@ -1,10 +1,11 @@
-import type { DatabaseSync } from "node:sqlite";
 import { EventEmitter } from "node:events";
 import { rpc, xdr } from "@stellar/stellar-sdk";
 import type { Config, NetworkConfig } from "./config.ts";
+import type { Storage } from "./lib/store/types.ts";
+import { asStorage } from "./lib/store/index.ts";
+import { updateActivePlanSubscriber, type ActivePlanSubscriber } from "./lib/plan-subscribers.ts";
 
 export type IndexerConfig = Config | NetworkConfig;
-import { clearProjections, readCursor, saveContractEvent, writeCursor, saveContractUpgrade } from "./lib/db.ts";
 import {
   big,
   decodeEvent,
@@ -16,7 +17,7 @@ import {
   type DecodedEvent,
 } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
-import { metrics, publishIndexerMetrics } from "./lib/metrics.ts";
+import { metrics, publishBusinessMetrics, publishIndexerMetrics } from "./lib/metrics.ts";
 import { defaultMerchantSummaryCache, type MerchantSummaryCache } from "./routes/index.ts";
 
 export { parseCloseTime };
@@ -24,6 +25,8 @@ export { parseCloseTime };
 /** RPC caps a single getEvents window; stay well inside it. */
 const LEDGER_WINDOW = 8_000;
 const PAGE_LIMIT = 200;
+/** Ledgers between two `indexer progress` log lines when none is configured. */
+const DEFAULT_PROGRESS_LEDGERS = 10_000;
 
 /** The RPC calls the indexer makes. Narrow so tests can supply a fake. */
 export type IndexerRpc = Pick<rpc.Server, "getLatestLedger" | "getHealth" | "getEvents">;
@@ -74,6 +77,16 @@ export interface IndexerStatus {
    */
   paused?: boolean;
   /**
+   * Last ledger the raw event stream (the `events` table) reaches. The
+   * projection's cursor may trail this when raw events have been retained
+   * but not yet projected, so the two can be compared.
+   */
+  eventsLedger?: number;
+  /**
+   * Ledgers the projection trails the raw event stream by.
+   */
+  eventsLag?: number;
+  /**
    * Reconcile passes run since process start. Each pass re-reads a sample of
    * active mandates from the contract and repairs drift the indexer may have
    * missed.
@@ -88,9 +101,10 @@ export interface IndexerStatus {
 }
 
 export class Indexer {
-  private readonly db: DatabaseSync;
+  private readonly db: Storage;
   private readonly server: IndexerRpc;
   private readonly config: IndexerConfig;
+  private directApplyTail: Promise<void> = Promise.resolve();
   readonly events = new EventEmitter();
   readonly merchantCache: MerchantSummaryCache;
   readonly status: IndexerStatus = {
@@ -102,6 +116,8 @@ export class Indexer {
     lastLedgerCloseTime: null,
     freshnessSeconds: null,
     paused: false,
+    eventsLedger: 0,
+    eventsLag: 0,
   };
   /** Events since process start that failed spec validation. */
   get mismatchedEvents(): number {
@@ -114,6 +130,18 @@ export class Indexer {
    * {@link resume} — so the API keeps serving the current projection while an
    * operator investigates.
    */
+  /** Re-read the raw event stream's tip from the events table. */
+  private async refreshEventsLedger(): Promise<void> {
+    try {
+      const row = await this.db.get<{ m: number | string | null }>("SELECT MAX(ledger) AS m FROM events");
+      const m = Number(row?.m ?? 0);
+      this.status.eventsLedger = m;
+      this.status.eventsLag = Math.max(0, m - (this.status.cursor ?? 0));
+    } catch {
+      // keep previous values
+    }
+  }
+
   pause(): void {
     this.status.paused = true;
   }
@@ -124,24 +152,93 @@ export class Indexer {
   }
 
   constructor(
-    db: DatabaseSync,
+    db: Storage | import("node:sqlite").DatabaseSync,
     server: IndexerRpc,
     config: IndexerConfig,
     merchantCache: MerchantSummaryCache = defaultMerchantSummaryCache,
     archive?: Archive,
   ) {
-    this.db = db;
+    this.db = asStorage(db);
     this.server = server;
     this.config = config;
     this.merchantCache = merchantCache;
     this.archive = archive;
     // Publish the starting state, so a scrape sees the series from the first
     // moment and not only once the first pass has run.
-    this.publishMetrics(0);
+    this.ready = this.publishMetrics(0);
+    // Nothing else awaits it at construction; mark the rejection handled so it
+    // cannot surface as an unhandled rejection. Callers that care (the metrics
+    // test, anything that scrapes before the first pass) await `ready`.
+    void this.ready.catch(() => undefined);
   }
+
+  /** Resolves when the constructor's first metrics publish has completed. */
+  readonly ready: Promise<void>;
 
   /** The archive used to backfill a gap, if ARCHIVE_URL was configured. */
   private readonly archive: Archive | undefined;
+
+  /**
+   * Where the current progress interval started: the cursor, the wall-clock
+   * time, and the events applied and mismatched since then. Null until the
+   * first pass that reads ledgers.
+   */
+  private progress: { ledger: number; at: number; applied: number; mismatched: number } | null = null;
+
+  /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
+  private get progressLedgers(): number {
+    const setting =
+      "INDEXER_PROGRESS_LEDGERS" in this.config
+        ? this.config.INDEXER_PROGRESS_LEDGERS
+        : this.config.progressLedgers;
+    return setting ?? DEFAULT_PROGRESS_LEDGERS;
+  }
+
+  /**
+   * Log `indexer progress` once the cursor has moved `progressLedgers` past
+   * the start of the current interval, then start a new interval at the
+   * cursor. One line per interval, however many passes it took, so a long
+   * catch-up reports at a steady cadence and a caught-up indexer (a few
+   * ledgers per pass) stays quiet. Structured fields only: the network, the
+   * cursor and the latest ledger, how far behind it is, the ledgers and
+   * events covered since the last line, and the rate.
+   */
+  private reportProgress(
+    start: number,
+    startedAt: number,
+    cursor: number,
+    latest: number,
+    applied: number,
+    mismatched: number,
+  ): void {
+    const every = this.progressLedgers;
+    if (every <= 0) return;
+    const now = Date.now();
+    // A cursor that moved backwards (a reindex rewound it) starts afresh. A
+    // new interval starts when this pass did, so its rate covers the pass.
+    if (this.progress === null || start < this.progress.ledger) {
+      this.progress = { ledger: start, at: startedAt, applied: 0, mismatched: 0 };
+    }
+    this.progress.applied += applied;
+    this.progress.mismatched += mismatched;
+    const ledgers = cursor - this.progress.ledger;
+    if (ledgers < every) return;
+    const seconds = Math.max(0.001, (now - this.progress.at) / 1000);
+    logger.info(
+      {
+        network: this.networkLabel,
+        cursor,
+        latest,
+        behind: Math.max(0, latest - cursor),
+        ledgers,
+        events: this.progress.applied,
+        mismatched: this.progress.mismatched,
+        ledgersPerSecond: Math.round(ledgers / seconds),
+      },
+      "indexer progress",
+    );
+    this.progress = { ledger: cursor, at: now, applied: 0, mismatched: 0 };
+  }
 
   /** Advance past a gap the RPC cannot serve; accepts silent under-reporting. */
   private get allowGaps(): boolean {
@@ -184,9 +281,15 @@ export class Indexer {
    * operator needs, and the lag it leaves behind is exactly what the alert is
    * for.
    */
-  private publishMetrics(applied: number): void {
+  private async publishMetrics(applied: number): Promise<void> {
     const network = this.networkLabel;
     publishIndexerMetrics(this.status, network);
+    // The business gauges come from the projection this pass just wrote (or
+    // left untouched), so they are re-read here: after each pass the series
+    // describe the current mandate base, merchant base and MRR. The read is
+    // one indexed statement and logs-and-continues on failure, so it cannot
+    // crash the loop.
+    await publishBusinessMetrics(this.db, network);
     if (applied > 0) metrics.increment("events_applied", applied, { network });
   }
 
@@ -265,17 +368,21 @@ export class Indexer {
           pastEnd = true;
           break;
         }
-        this.retain(raw);
+        await this.retain(raw);
         const decoded = decodeEvent(raw);
         if (!decoded) continue;
-        if (this.apply(decoded) !== "mismatched") applied += 1;
+        if ((await this.apply(decoded)) !== "mismatched") applied += 1;
       }
       if (pastEnd || (page.events ?? []).length === 0 || !page.cursor) break;
       cursor = page.cursor;
     }
     // Only advance after the whole gap is applied, so a retry replays it
     // safely: every apply path is idempotent.
-    writeCursor(this.db, end);
+    await this.db.run(
+      `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
+       ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
+      [end],
+    );
     this.status.cursor = end;
     return applied;
   }
@@ -360,19 +467,25 @@ export class Indexer {
     // write nothing, so the saved cursor and projection are untouched and the
     // loop resumes exactly where it left off on resume.
     if (this.status.paused) {
-      this.publishMetrics(0);
+      await this.refreshEventsLedger();
+      await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: this.status.cursor, latest: this.status.latest };
     }
+    const startedAt = Date.now();
     const latestRes = await this.server.getLatestLedger();
     const latest = latestRes.sequence;
     const latestCloseTime = parseCloseTime((latestRes as { closeTime?: unknown }).closeTime);
-    const start = await this.firstLedger(readCursor(this.db, 0));
+    const savedCursor = await this.db.get<{ last_ledger: number }>(
+      "SELECT last_ledger FROM cursor WHERE id = 1",
+    );
+    const start = await this.firstLedger(savedCursor?.last_ledger ?? 0);
 
     this.status.latest = latest;
     if (start > latest) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
-      this.publishMetrics(0);
+      await this.refreshEventsLedger();
+      await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
 
@@ -382,7 +495,8 @@ export class Indexer {
     if (end <= start) {
       this.status.cursor = start;
       this.updateFreshness(latestCloseTime, null, start, latest);
-      this.publishMetrics(0);
+      await this.refreshEventsLedger();
+      await this.publishMetrics(0);
       return { applied: 0, mismatched: 0, cursor: start, latest };
     }
 
@@ -414,54 +528,96 @@ export class Indexer {
         failure = result.reason;
         break;
       }
-      for (const raw of result.value) {
-        const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
-        if (ct !== null) lastSeenCloseTime = ct;
-        this.retain(raw);
-        const decoded = decodeEvent(raw);
-        if (!decoded) continue;
-        if (this.apply(decoded) !== "mismatched") applied += 1;
-        else mismatched += 1;
+      const nextCursor = windows[i]!.end;
+      const windowResult = await this.db.transaction(async (storage) => {
+        let windowApplied = 0;
+        let windowMismatched = 0;
+        const notifications: DecodedEvent[] = [];
+        for (const raw of result.value) {
+          const ct = parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt);
+          if (ct !== null) lastSeenCloseTime = ct;
+          await this.retain(raw, storage);
+          const decoded = decodeEvent(raw);
+          if (!decoded) continue;
+          if ((await this.apply(decoded, storage, notifications)) !== "mismatched") windowApplied += 1;
+          else windowMismatched += 1;
+        }
+        await storage.run(
+          `INSERT INTO cursor (id, last_ledger) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET last_ledger = excluded.last_ledger`,
+          [nextCursor],
+        );
+        return { applied: windowApplied, mismatched: windowMismatched, notifications };
+      });
+      applied += windowResult.applied;
+      mismatched += windowResult.mismatched;
+      cursor = nextCursor;
+      for (const notification of windowResult.notifications) {
+        this.events.emit("applied", notification);
       }
-      // Only advance after this window is applied, so a later failure resumes
-      // here instead of replaying what already landed.
-      cursor = windows[i]!.end;
-      writeCursor(this.db, cursor);
     }
 
     this.status.cursor = cursor;
     this.updateFreshness(latestCloseTime, lastSeenCloseTime, cursor, latest);
-    this.publishMetrics(applied);
+    await this.refreshEventsLedger();
+    // Windows applied before a failed fetch are real progress, so they count.
+    this.reportProgress(start, startedAt, cursor, latest, applied, mismatched);
+    await this.publishMetrics(applied);
     if (failure !== undefined) throw failure;
     return { applied, mismatched, cursor, latest };
   }
 
 
   /** Preserve every event before decoding, including unknown contract events. */
-  private retain(raw: rpc.Api.EventResponse): void {
-    saveContractEvent(this.db, {
-      eventId: raw.id ?? `${raw.ledger}:${raw.txHash}:${raw.topic.map((t) => t.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`,
-      contractId: raw.contractId?.toString() ?? "",
-      ledger: raw.ledger,
-      txHash: raw.txHash,
-      eventIndex: raw.id ?? "",
-      topics: JSON.stringify(raw.topic.map((topic) => topic.toXDR("base64"))),
-      data: raw.value.toXDR("base64"),
-      closeTime: parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
-    });
+  private async retain(raw: rpc.Api.EventResponse, storage: Storage = this.db): Promise<void> {
+    const eventId =
+      raw.id ??
+      `${raw.ledger}:${raw.txHash}:${raw.topic.map((topic) => topic.toXDR("base64")).join(":")}:${raw.value.toXDR("base64")}`;
+    await storage.run(
+      `INSERT OR IGNORE INTO events
+         (event_id, contract_id, ledger, tx_hash, event_index, topics, data, close_time)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        eventId,
+        raw.contractId?.toString() ?? "",
+        raw.ledger,
+        raw.txHash,
+        raw.id ?? "",
+        JSON.stringify(raw.topic.map((topic) => topic.toXDR("base64"))),
+        raw.value.toXDR("base64"),
+        parseCloseTime((raw as { ledgerClosedAt?: unknown }).ledgerClosedAt),
+      ],
+    );
   }
 
   /** Rebuild event-derived projections locally, without querying RPC. */
-  rebuildProjections(): number {
-    const rows = this.db.prepare(
+  async rebuildProjections(): Promise<number> {
+    const rows = await this.db.all<{
+      contract_id: string;
+      ledger: number;
+      tx_hash: string;
+      topics: string;
+      data: string;
+      close_time: number | null;
+    }>(
       "SELECT contract_id, ledger, tx_hash, topics, data, close_time FROM events ORDER BY ledger, event_id",
-    ).all() as Array<{
-      contract_id: string; ledger: number; tx_hash: string;
-      topics: string; data: string; close_time: number | null;
-    }>;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      clearProjections(this.db);
+    );
+    return this.db.transaction(async (storage) => {
+      for (const table of [
+        "plans",
+        "plan_subscriber_counts",
+        "plan_active_subscribers",
+        "mandates",
+        "charges",
+        "vault_events",
+        "fee_history",
+        "mandate_events",
+        "mandate_timeline",
+        "contract_upgrades",
+        "merchant_profiles",
+      ]) {
+        await storage.run(`DELETE FROM ${table}`);
+      }
       let applied = 0;
       for (const row of rows) {
         const raw = {
@@ -473,14 +629,10 @@ export class Indexer {
           ledgerClosedAt: row.close_time === null ? undefined : new Date(row.close_time * 1000).toISOString(),
         } as unknown as rpc.Api.EventResponse;
         const decoded = decodeEvent(raw);
-        if (decoded && this.apply(decoded) === "applied") applied += 1;
+        if (decoded && (await this.apply(decoded, storage)) === "applied") applied += 1;
       }
-      this.db.exec("COMMIT");
       return applied;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   /** Run passes until the cursor reaches the RPC's latest ledger. */
@@ -504,7 +656,31 @@ export class Indexer {
    * the spec does not cover are left to the switch below, which ignores
    * unknown names.
    */
-  apply(e: DecodedEvent): ApplyOutcome {
+  async apply(
+    e: DecodedEvent,
+    storage: Storage = this.db,
+    notifications?: DecodedEvent[],
+  ): Promise<ApplyOutcome> {
+    if (storage !== this.db) return this.applyNow(e, storage, notifications);
+
+    const previous = this.directApplyTail;
+    let release!: () => void;
+    this.directApplyTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await this.applyNow(e, storage, notifications);
+    } finally {
+      release();
+    }
+  }
+
+  private async applyNow(
+    e: DecodedEvent,
+    storage: Storage,
+    notifications?: DecodedEvent[],
+  ): Promise<ApplyOutcome> {
     const problems = specProblems(e);
     if (problems !== null && problems.length > 0) {
       this.status.mismatchedEvents = this.mismatchedEvents + 1;
@@ -523,62 +699,58 @@ export class Indexer {
 
     switch (e.name) {
       case "plan_created":
-        this.onPlanCreated(e);
+        await this.onPlanCreated(e, storage);
         return "applied";
       case "plan_status_changed":
-        this.onPlanStatus(e);
+        await this.onPlanStatus(e, storage);
+        return "applied";
+      case "subscribed":
+        await this.onSubscribed(e, storage);
+        await this.recordChurn(e, "started", str(e.topics[2]), storage);
+        this.notify(e, notifications);
+        await this.recordTimeline(e, storage);
         return "applied";
       case "profile_updated":
-        this.onProfileUpdated(e);
+        await this.onProfileUpdated(e, storage);
         return "applied";
-      case "subscribed": {
-        const [, , merchant] = e.topics;
-        this.onSubscribed(e);
-        this.recordChurn(e, "started", str(merchant));
-        this.recordTimeline(e);
-        this.events.emit("applied", e);
-        return "applied";
-      }
       case "charged":
-        this.onCharged(e);
-        this.recordTimeline(e);
-        this.events.emit("applied", e);
+        await this.onCharged(e, storage);
+        this.notify(e, notifications);
+        await this.recordTimeline(e, storage);
         return "applied";
-      case "cancelled": {
-        // The cancel event names the subscriber, not the merchant, so the
-        // merchant comes from the mandate row the projection holds.
-        const merchant = this.onStatus(e, "Cancelled", "subscriber");
-        this.recordChurn(e, "cancelled", merchant);
-        this.recordTimeline(e);
-        this.events.emit("applied", e);
-        return "applied";
-      }
+      case "cancelled":
+        {
+          const merchant = await this.onStatus(e, "Cancelled", "subscriber", storage);
+          await this.recordChurn(e, "cancelled", merchant, storage);
+          this.notify(e, notifications);
+          await this.recordTimeline(e, storage);
+          return "applied";
+        }
       case "mandate_ended": {
-        // The end event names the merchant in its second topic; the mandate
-        // row is the fallback when the projection has not seen it yet.
-        const merchant = this.onStatus(e, "Cancelled", "merchant") ?? str(e.topics[1]);
-        this.recordChurn(e, "ended", merchant);
-        this.recordTimeline(e);
-        this.events.emit("applied", e);
+        const merchant = await this.onStatus(e, "Cancelled", "merchant", storage) ?? str(e.topics[1]);
+        await this.recordChurn(e, "ended", merchant, storage);
+        await this.recordTimeline(e, storage);
+        this.notify(e, notifications);
         return "applied";
       }
       case "mandate_completed": {
-        const merchant = this.onStatus(e, "Completed");
-        this.recordChurn(e, "completed", merchant);
-        this.recordTimeline(e);
+        const merchant = await this.onStatus(e, "Completed", null, storage);
+        await this.recordChurn(e, "completed", merchant, storage);
+        this.notify(e, notifications);
+        await this.recordTimeline(e, storage);
         return "applied";
       }
       case "pause_changed":
-        this.onPauseChanged(e);
-        this.recordTimeline(e);
+        await this.onPauseChanged(e, storage);
+        await this.recordTimeline(e, storage);
         return "applied";
       case "fee_changed":
-        this.onFeeChanged(e);
+        await this.onFeeChanged(e, storage);
         return "applied";
       case "deposit":
       case "withdraw":
       case "debit":
-        this.onVaultEvent(e);
+        await this.onVaultEvent(e, storage);
         return "applied";
       case "upgraded": {
         // Emitted by a contract's admin-gated upgrade with the new wasm hash.
@@ -586,7 +758,7 @@ export class Indexer {
         const hash =
           raw instanceof Uint8Array ? Buffer.from(raw).toString("hex") : typeof raw === "string" ? raw : "";
         if (!hash) return "unknown";
-        this.recordContractUpgrade(e.contractId, e.txHash, e.ledger, e.closeTime ?? null, hash);
+        await this.recordContractUpgrade(e.contractId, e.txHash, e.ledger, e.closeTime ?? null, hash, storage);
         return "applied";
       }
       default:
@@ -595,12 +767,39 @@ export class Indexer {
     }
   }
 
+  private notify(event: DecodedEvent, notifications?: DecodedEvent[]): void {
+    if (notifications) notifications.push(event);
+    else this.events.emit("applied", event);
+  }
+
+  private async onPlanCreated(e: DecodedEvent, storage: Storage): Promise<void> {
+    const [merchant, planId] = e.topics;
+    await this.merchantCache.invalidate(str(merchant));
+    await storage.run(
+      `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           merchant = excluded.merchant, name = excluded.name,
+           token = excluded.token,
+           amount = excluded.amount, period = excluded.period`,
+      [
+        num(planId),
+        str(merchant),
+        str(e.data.name),
+        str(e.data.token),
+        big(e.data.amount),
+        num(e.data.period),
+        e.ledger,
+      ],
+    );
+  }
+
   /**
    * Append each on-chain lifecycle event without altering the existing churn
    * aggregation table. A tx can emit different kinds for the same mandate;
    * (mandate_id, tx_hash, kind) makes crash replays idempotent.
    */
-  private recordTimeline(e: DecodedEvent): void {
+  private async recordTimeline(e: DecodedEvent, storage: Storage): Promise<void> {
     const mandateId = num(e.topics[0]);
     const details: Record<string, string | boolean> = {};
     if (e.name === "pause_changed") {
@@ -610,69 +809,40 @@ export class Indexer {
       details.fee = big(e.data.fee);
       details.chargesMade = String(e.data.charges_made);
     }
-    this.db.prepare(
+    await storage.run(
       "INSERT OR IGNORE INTO mandate_timeline (mandate_id, tx_hash, kind, ledger, at, details) VALUES (?, ?, ?, ?, ?, ?)",
-    ).run(mandateId, e.txHash, e.name, e.ledger, e.closeTime ?? null, JSON.stringify(details));
+      [mandateId, e.txHash, e.name, e.ledger, e.closeTime ?? null, JSON.stringify(details)],
+    );
   }
 
-  private onPlanCreated(e: DecodedEvent): void {
-    const [merchant, planId] = e.topics;
-    this.merchantCache.invalidate(str(merchant));
-    this.db
-      .prepare(
-        `INSERT INTO plans (id, merchant, name, token, amount, period, active, ledger)
-         VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-         ON CONFLICT(id) DO UPDATE SET
-           merchant = excluded.merchant, name = excluded.name,
-           token = excluded.token,
-           amount = excluded.amount, period = excluded.period`,
-      )
-      .run(
-        num(planId),
-        str(merchant),
-        str(e.data.name),
-        str(e.data.token),
-        big(e.data.amount),
-        num(e.data.period),
-        e.ledger,
-      );
-  }
-
-  private onPlanStatus(e: DecodedEvent): void {
+  private async onPlanStatus(e: DecodedEvent, storage: Storage): Promise<void> {
     const [, planId] = e.topics;
-    this.db
-      .prepare("UPDATE plans SET active = ? WHERE id = ?")
-      .run(e.data.active ? 1 : 0, num(planId));
+    await storage.run("UPDATE plans SET active = ? WHERE id = ?", [e.data.active ? 1 : 0, num(planId)]);
   }
 
-  /**
-   * A merchant's self-declared profile: the latest `set_profile` wins.
-   *
-   * Keyed on the merchant, and the update only lands when the event is no
-   * older than the stored row, so replaying a range (or backfilling an older
-   * one from the archive) can never roll a profile back. Within one ledger the
-   * events are applied in order, so the last update of the ledger wins on a
-   * replay exactly as it did the first time.
-   */
-  private onProfileUpdated(e: DecodedEvent): void {
+  /** Update a merchant's profile without letting a replay roll it backwards. */
+  private async onProfileUpdated(e: DecodedEvent, storage: Storage): Promise<void> {
     const [merchant] = e.topics;
-    this.db
-      .prepare(
-        `INSERT INTO merchant_profiles (merchant, name, url, ledger)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(merchant) DO UPDATE SET
-           name = excluded.name, url = excluded.url, ledger = excluded.ledger
-         WHERE excluded.ledger >= merchant_profiles.ledger`,
-      )
-      .run(str(merchant), str(e.data.name), str(e.data.url), e.ledger);
+    await storage.run(
+      `INSERT INTO merchant_profiles (merchant, name, url, ledger)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(merchant) DO UPDATE SET
+         name = excluded.name, url = excluded.url, ledger = excluded.ledger
+       WHERE excluded.ledger >= merchant_profiles.ledger`,
+      [str(merchant), str(e.data.name), str(e.data.url), e.ledger],
+    );
   }
 
-  private onSubscribed(e: DecodedEvent): void {
+  private async onSubscribed(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId, subscriber, merchant] = e.topics;
-    this.merchantCache.invalidate(str(merchant));
-    this.db
-      .prepare(
-        `INSERT INTO mandates
+    const id = num(mandateId);
+    const previous = await storage.get<ActivePlanSubscriber>(
+      "SELECT plan_id, subscriber, status FROM mandates WHERE id = ?",
+      [id],
+    );
+    await this.merchantCache.invalidate(str(merchant));
+    await storage.run(
+      `INSERT INTO mandates
            (id, subscriber, merchant, plan_id, amount, period, next_charge,
             last_charge, charges_made, max_charges, fee_bps, status, ledger)
          VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'Active', ?)
@@ -681,9 +851,8 @@ export class Indexer {
            merchant    = excluded.merchant,
            max_charges = excluded.max_charges,
            fee_bps     = excluded.fee_bps`,
-      )
-      .run(
-        num(mandateId),
+      [
+        id,
         str(subscriber),
         str(merchant),
         num(e.data.plan_id),
@@ -693,23 +862,16 @@ export class Indexer {
         num(e.data.max_charges),
         num(e.data.fee_bps),
         e.ledger,
-      );
+      ],
+    );
+    await updateActivePlanSubscriber(storage, previous, {
+      plan_id: previous?.plan_id ?? num(e.data.plan_id),
+      subscriber: str(subscriber),
+      status: previous?.status ?? "Active",
+    });
   }
 
-  /**
-   * When the charge happened, in unix milliseconds.
-   *
-   * The ledger's close time is the chain's own clock, so the same charge
-   * carries the same timestamp however often it is indexed: a backfill or a
-   * restart after a deploy no longer collapses the whole history onto one
-   * moment, and a report bucketed by it describes the chain rather than the
-   * indexer. The row is written with `INSERT OR IGNORE`, so a replay leaves
-   * the stored value untouched.
-   *
-   * An event that carried no close time has no chain clock to use; the
-   * indexer's wall clock is the fallback, and it is logged because it is the
-   * one value that is not reproducible.
-   */
+  /** The ledger close time is stable across replays; wall time is only a fallback. */
   private chargedAt(e: DecodedEvent): number {
     const closeTime = e.closeTime;
     if (closeTime === undefined || closeTime === null) {
@@ -722,19 +884,18 @@ export class Indexer {
     return closeTime * 1000;
   }
 
-  private onCharged(e: DecodedEvent): void {
+  private async onCharged(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId, subscriber, merchant] = e.topics;
     const id = num(mandateId);
-    this.merchantCache.invalidate(str(merchant));
+    await this.merchantCache.invalidate(str(merchant));
 
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO charges
+    await storage.run(
+      `INSERT INTO charges
            (tx_hash, mandate_id, subscriber, merchant, amount, fee,
             charges_made, next_charge, ledger, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (tx_hash, mandate_id) DO NOTHING`,
+      [
         e.txHash,
         id,
         str(subscriber),
@@ -745,49 +906,48 @@ export class Indexer {
         num(e.data.next_charge),
         e.ledger,
         this.chargedAt(e),
-      );
+      ],
+    );
 
     // The Charged event carries next_charge but not last_charge. The contract
     // sets next_charge = now + period, so the settlement time is recoverable
     // from the mandate's own period.
     // Guard against out-of-order delivery: never move a mandate backwards.
-    this.db
-      .prepare(
-        `UPDATE mandates
+    await storage.run(
+      `UPDATE mandates
             SET charges_made = ?,
                 next_charge  = ?,
                 last_charge  = MAX(0, ? - period)
           WHERE id = ? AND charges_made < ?`,
-      )
-      .run(
+      [
         num(e.data.charges_made),
         num(e.data.next_charge),
         num(e.data.next_charge),
         id,
         num(e.data.charges_made),
-      );
+      ],
+    );
   }
 
-  /**
-   * `endedBy` records which side cancelled; completion leaves it null.
-   *
-   * Returns the mandate's merchant, which the churn log needs and which only
-   * the projection knows for the events that do not name it themselves.
-   */
-  private onStatus(
+  /** `endedBy` records which side cancelled; completion leaves it null. */
+  private async onStatus(
     e: DecodedEvent,
     status: string,
-    endedBy: string | null = null,
-  ): string | undefined {
+    endedBy: string | null,
+    storage: Storage,
+  ): Promise<string | undefined> {
     const [mandateId] = e.topics;
     const mid = num(mandateId);
-    const row = this.db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(mid) as
-      | { merchant: string }
-      | undefined;
-    if (row) this.merchantCache.invalidate(row.merchant);
-    this.db
-      .prepare("UPDATE mandates SET status = ?, ended_by = ? WHERE id = ?")
-      .run(status, endedBy, mid);
+    const row = await storage.get<ActivePlanSubscriber & { merchant: string }>(
+      "SELECT merchant, plan_id, subscriber, status FROM mandates WHERE id = ?",
+      [mid],
+    );
+    if (row) await this.merchantCache.invalidate(row.merchant);
+    const changed = row && await storage.get<{ id: number }>(
+      "UPDATE mandates SET status = ?, ended_by = ? WHERE id = ? AND status = ? RETURNING id",
+      [status, endedBy, mid, row.status],
+    );
+    if (row && changed) await updateActivePlanSubscriber(storage, row, { ...row, status });
     return row?.merchant;
   }
 
@@ -803,11 +963,12 @@ export class Indexer {
    * departure, so a mandate that is both started and cancelled contributes to
    * both counts but can never be counted as leaving twice.
    */
-  private recordChurn(
+  private async recordChurn(
     e: DecodedEvent,
     kind: "started" | "cancelled" | "ended" | "completed",
     merchant: string | undefined,
-  ): void {
+    storage: Storage,
+  ): Promise<void> {
     // Without a merchant there is nobody to attribute the event to, and
     // without a close time there is no bucket to file it under. Either way
     // the projection itself is already written, so the event is skipped
@@ -816,45 +977,50 @@ export class Indexer {
     const at = e.closeTime;
     if (at === undefined || at === null) return;
     const [mandateId] = e.topics;
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO mandate_events (mandate_id, slot, merchant, kind, at, ledger)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    await storage.run(
+      `INSERT OR IGNORE INTO mandate_events (mandate_id, slot, merchant, kind, at, ledger)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
         num(mandateId),
         kind === "started" ? "start" : "departure",
         merchant,
         kind,
         at,
         e.ledger,
-      );
+      ],
+    );
   }
 
-  private onPauseChanged(e: DecodedEvent): void {
+  private async onPauseChanged(e: DecodedEvent, storage: Storage): Promise<void> {
     const [mandateId] = e.topics;
     const mid = num(mandateId);
-    const row = this.db.prepare("SELECT merchant FROM mandates WHERE id = ?").get(mid) as
-      | { merchant: string }
-      | undefined;
-    if (row) this.merchantCache.invalidate(row.merchant);
-    this.db
-      .prepare(
-        `UPDATE mandates SET status = ?
-          WHERE id = ? AND status IN ('Active','Paused')`,
-      )
-      .run(e.data.paused ? "Paused" : "Active", mid);
+    const row = await storage.get<ActivePlanSubscriber & { merchant: string }>(
+      "SELECT merchant, plan_id, subscriber, status FROM mandates WHERE id = ?",
+      [mid],
+    );
+    if (row) await this.merchantCache.invalidate(row.merchant);
+    const desiredStatus = e.data.paused ? "Paused" : "Active";
+    const changed = row && (row.status === "Active" || row.status === "Paused") && await storage.get<{ id: number }>(
+      `UPDATE mandates SET status = ?
+          WHERE id = ? AND status = ? RETURNING id`,
+      [desiredStatus, mid, row.status],
+    );
+    if (row && changed) {
+      await updateActivePlanSubscriber(storage, row, {
+        ...row,
+        status: desiredStatus,
+      });
+    }
   }
 
-  private onVaultEvent(e: DecodedEvent): void {
+  private async onVaultEvent(e: DecodedEvent, storage: Storage): Promise<void> {
     const [user, token, counterparty] = e.topics;
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO vault_events
-           (tx_hash, kind, user, token, counterparty, amount, balance, ledger)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    await storage.run(
+      `INSERT INTO vault_events
+           (tx_hash, kind, "user", token, counterparty, amount, balance, ledger)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (tx_hash, kind, "user", amount) DO NOTHING`,
+      [
         e.txHash,
         e.name,
         str(user),
@@ -863,43 +1029,42 @@ export class Indexer {
         big(e.data.amount),
         big(e.data.balance),
         e.ledger,
-      );
+      ],
+    );
   }
 
-  private onFeeChanged(e: DecodedEvent): void {
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO fee_history (tx_hash, old_fee_bps, new_fee_bps, ledger)
-         VALUES (?, ?, ?, ?)`,
-      )
-      .run(
+  private async onFeeChanged(e: DecodedEvent, storage: Storage): Promise<void> {
+    await storage.run(
+      `INSERT INTO fee_history (tx_hash, old_fee_bps, new_fee_bps, ledger)
+         VALUES (?, ?, ?, ?) ON CONFLICT (tx_hash) DO NOTHING`,
+      [
         e.txHash,
         num(e.data.old_fee_bps),
         num(e.data.new_fee_bps),
         e.ledger,
-      );
+      ],
+    );
   }
 
   /**
    * Record a contract upgrade when detected through contract events.
    * This tracks when a contract's code is upgraded with metadata about the change.
    */
-  private recordContractUpgrade(
+  private async recordContractUpgrade(
     contractId: string,
     txHash: string,
     ledger: number,
     closeTime: number | null,
     newHash: string,
+    storage: Storage,
     oldHash?: string,
-  ): void {
+  ): Promise<void> {
     if (!closeTime) return;
-    saveContractUpgrade(this.db, {
-      contractId,
-      txHash,
-      ledger,
-      closeTime,
-      newHash,
-      oldHash,
-    });
+    await storage.run(
+      `INSERT OR IGNORE INTO contract_upgrades
+         (contract_id, tx_hash, ledger, close_time, new_hash, old_hash)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [contractId, txHash, ledger, closeTime, newHash, oldHash ?? null],
+    );
   }
 }

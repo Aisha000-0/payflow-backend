@@ -45,15 +45,24 @@ before(async () => {
     closeTime: number | null = null,
   ): DecodedEvent => ({ name, contractId: "C", ledger: 1, txHash: tx, topics, data, closeTime });
 
-  ix.apply(ev("plan_created", [MERCHANT, 1n], {
+  await ix.apply(ev("plan_created", [MERCHANT, 1n], {
     token: "C", amount: 10_000_000n, period: 2_592_000n, name: "Pro Monthly",
   }));
-  ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("subscribed", [1n, SUBSCRIBER, MERCHANT], {
     plan_id: 1n, amount: 10_000_000n, period: 2_592_000n, next_charge: 1n, fee_bps: 100,
   }, "t", 1_700_000_000));
-  ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
+  await ix.apply(ev("charged", [1n, SUBSCRIBER, MERCHANT], {
     amount: 9_900_000n, fee: 100_000n, charges_made: 1n, next_charge: 4_000_000_000n,
   }, "tx1"));
+
+  // What the keeper recorded for mandate 1: a vault shortfall, then the settlement.
+  const attempt = db.prepare(
+    `INSERT INTO charge_attempts
+       (mandate_id, attempted_at, result, error_code, tx_hash, shortfall, failures, retry_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  attempt.run(1, 1_700_000_100, "skipped", "INSUFFICIENT_BALANCE", null, "400000", 1, 1_700_000_160);
+  attempt.run(1, 1_700_000_160, "settled", null, "tx1", null, 0, null);
 
   const app = createApp(db, config, status);
   await new Promise<void>((resolve) => {
@@ -85,6 +94,7 @@ describe("typed api client", () => {
     const all = await client.plans();
     assert.equal(all.plans.length, 1);
     assert.equal(all.plans[0]?.name, "Pro Monthly");
+    assert.equal(all.plans[0]?.activeSubscribers, 1);
     // Amounts stay strings end to end; the client never turns money into a float.
     assert.equal(typeof all.plans[0]?.amount, "string");
 
@@ -92,6 +102,8 @@ describe("typed api client", () => {
     assert.equal(mine.plans.length, 1);
     const none = await client.plans({ merchant: UNKNOWN_MERCHANT });
     assert.equal(none.plans.length, 0);
+    const popular = await client.plans({ sort: "subscribers" });
+    assert.equal(popular.plans[0]?.activeSubscribers, 1);
   });
 
   test("fetches one plan and one mandate", async () => {
@@ -173,6 +185,7 @@ describe("typed api client", () => {
         mandateCount: 1,
         chargeCount: 1,
         totalCollected: "9900000",
+        ltv: "9900000",
       },
     ]);
 
@@ -196,6 +209,35 @@ describe("typed api client", () => {
       address: SUBSCRIBER,
       events: [],
     });
+  });
+
+  test("reads a mandate's charge attempts, with the reason each one did not settle", async () => {
+    const { attempts } = await client.chargeAttempts(1);
+    assert.deepEqual(
+      attempts.map(({ result, errorCode, txHash, shortfall, failures }) => ({
+        result,
+        errorCode,
+        txHash,
+        shortfall,
+        failures,
+      })),
+      [
+        { result: "settled", errorCode: null, txHash: "tx1", shortfall: undefined, failures: 0 },
+        { result: "skipped", errorCode: "INSUFFICIENT_BALANCE", txHash: null, shortfall: "400000", failures: 1 },
+      ],
+    );
+
+    const latest = await client.chargeAttempts(1, { limit: 1 });
+    assert.deepEqual(latest.attempts.map((a) => a.result), ["settled"]);
+
+    await assert.rejects(
+      () => client.chargeAttempts(999),
+      (err: unknown) => err instanceof PayflowApiError && err.status === 404,
+    );
+    await assert.rejects(
+      () => client.chargeAttempts(1, { limit: 0 }),
+      (err: unknown) => err instanceof PayflowApiError && err.status === 400,
+    );
   });
 
   test("a 404 raises PayflowApiError with the parsed error body", async () => {

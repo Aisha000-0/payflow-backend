@@ -1,6 +1,6 @@
 import { Router } from "express";
-import type { DatabaseSync } from "node:sqlite";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
+import type { Storage } from "../lib/store/types.ts";
 import { sendApiError } from "./errors.ts";
 import { listRawContractEvents } from "../lib/queries.ts";
 
@@ -26,9 +26,9 @@ function parseAfter(value: string): [number, string] | null {
  * instead of changing that storage contract or silently skipping matches.
  * (ledger, event_id) is a stable unique ordering even for events in one tx.
  */
-export function rawEventsRouter(db: DatabaseSync): Router {
+export function rawEventsRouter(db: Storage): Router {
   const router = Router();
-  router.get("/events", (req, res) => {
+  router.get("/events", async (req, res) => {
     const contract = req.query.contract;
     const name = req.query.name;
     const after = req.query.after;
@@ -54,9 +54,14 @@ export function rawEventsRouter(db: DatabaseSync): Router {
     let ledger = start[0];
     let id = start[1];
     let exhausted = false;
+    // Without a name filter every row the query returns is an item, so one
+    // page plus the row that proves another page exists is all a request has
+    // to read. Only the name filter, which runs on the decoded topic, needs
+    // the larger scan batches.
+    const batchSize = name === undefined ? PAGE_SIZE + 1 : SCAN_SIZE;
     while (items.length <= PAGE_SIZE && !exhausted) {
-      const rows = listRawContractEvents(db, ledger, id, contract as string | undefined, SCAN_SIZE);
-      if (rows.length < SCAN_SIZE) exhausted = true;
+      const rows = await listRawContractEvents(db, ledger, id, contract as string | undefined, batchSize);
+      if (rows.length < batchSize) exhausted = true;
       for (const row of rows) {
         ledger = row.ledger;
         id = row.event_id;

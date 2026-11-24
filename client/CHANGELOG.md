@@ -1,0 +1,29 @@
+# Changelog
+
+All notable changes to `@mmm-pay/payflow-client`. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the package uses
+[semantic versioning](https://semver.org/).
+
+## [Unreleased]
+
+### Added
+
+- `activeSubscribers` on plan responses and `sort: "subscribers"` in `plans()`:
+  counts distinct subscribers with at least one active mandate per plan.
+- `chargeAttempts(mandateId, { limit })` for `GET /api/v1/mandates/:id/attempts`:
+  the keeper's attempts to charge a mandate, with the result, error code,
+  transaction hash and shortfall of each, and the `ChargeAttemptPage` and
+  `ChargeAttemptRow` types.
+
+## [0.1.0] - 2026-10-22
+
+### Added
+
+- The typed client as a standalone package, built from the same response
+  types the backend routes use. It has no runtime dependencies: `fetch` is
+  the only API it needs, so it runs in Node.js, Bun, Deno, and browsers.
+- `PayflowClient` for the read-only endpoints: health, plans, mandates,
+  charges, due mandates, merchant and subscriber summaries, merchant churn
+  and revenue, stats, protocol, vault, and keeper history.
+- `PayflowApiError`, which carries the HTTP status and the parsed error
+  envelope.

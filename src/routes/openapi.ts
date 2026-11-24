@@ -35,6 +35,8 @@ export interface SchemaObject {
   additionalProperties?: boolean | SchemaObject;
   /** A schema that must satisfy every listed schema. */
   allOf?: SchemaObject[];
+  /** A schema that must satisfy exactly one of the listed schemas. */
+  oneOf?: SchemaObject[];
   $ref?: string;
   minimum?: number;
   maximum?: number;
@@ -54,6 +56,7 @@ export interface ParameterObject {
 export interface ResponseObject {
   description: string;
   content?: Record<string, { schema: SchemaObject }>;
+  headers?: Record<string, { description?: string; schema: SchemaObject }>;
 }
 
 /** One operation (a method on a path). */
@@ -98,6 +101,45 @@ export interface OpenApiDocument {
 /** The API version, as `package.json` has it. */
 const API_VERSION = "0.2.0";
 
+/** The canonical, versioned root of the read API. */
+const API_V1 = "/api/v1";
+/** The unversioned root, an alias of `API_V1` for existing clients. */
+const API_ALIAS = "/api";
+
+/**
+ * The human-readable API reference, served at `/api/docs`.
+ *
+ * The page and its scripts are all served by this process: ReDoc's
+ * standalone bundle comes from the npm package at runtime, never from a CDN,
+ * so the documentation works offline and inside a locked-down network. The
+ * bootstrap is an external module rather than an inline script, which keeps
+ * the page compatible with the default `script-src 'self'` policy; it imports
+ * the bundle's `init` export (ReDoc 3 ships an ES module).
+ */
+export const DOCS_HTML = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Payflow API documentation</title>
+    <style>body { margin: 0; padding: 0; }</style>
+  </head>
+  <body>
+    <div id="redoc-container"></div>
+    <script type="module" src="/api/docs/docs.js"></script>
+  </body>
+</html>
+`;
+
+/**
+ * The page's bootstrap script: point ReDoc at the OpenAPI document this
+ * instance serves. ReDoc's own bundle is served beside it.
+ */
+export const DOCS_INIT_SCRIPT = `import { init } from "/api/docs/redoc.standalone.js";
+
+init("/api/openapi.json", {}, document.getElementById("redoc-container"));
+`;
+
 /**
  * The API changelog, which also carries the deprecation policy.
  *
@@ -141,6 +183,27 @@ const limitParameter = (): ParameterObject => ({
   required: false,
   description: "How many rows to return. Capped at 200; a larger value is not an error.",
   schema: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+});
+
+/**
+ * A query parameter bounding a range: unix seconds or an ISO 8601
+ * date/date-time, both inclusive at the endpoints. A date-only `from` starts
+ * the day and a date-only `to` ends it, both in UTC.
+ */
+const dateBoundParameter = (name: "from" | "to", description: string): ParameterObject => ({
+  name,
+  in: "query",
+  required: false,
+  description,
+  schema: {
+    oneOf: [
+      { type: "integer", minimum: 0, description: "Unix seconds." },
+      {
+        type: "string",
+        description: "An ISO 8601 date or date-time with a timezone, e.g. `2026-10-01`.",
+      },
+    ],
+  },
 });
 
 /** A query parameter holding a number of days. */
@@ -217,6 +280,17 @@ const errorResponse = (description: string): ResponseObject => ({
   },
 });
 
+/** A transient 503 that carries a `Retry-After` header with the suggested wait in seconds. */
+const transient503 = (description: string): ResponseObject => ({
+  ...errorResponse(description),
+  headers: {
+    "Retry-After": {
+      description: "Suggested number of seconds to wait before retrying the request.",
+      schema: { type: "integer", example: 30 },
+    },
+  },
+});
+
 /** The standard "not found" answer of an id-bearing route. */
 const notFound = (code: string, what: string): ResponseObject =>
   errorResponse(`No ${what} exists with that id (error.code = "${code}").`);
@@ -283,8 +357,9 @@ const unauthorizedProof = (): ResponseObject =>
 /**
  * The paths of the read API, mounted under `root`.
  *
- * `root` is `/api` for the default network and `/api/<name>` for every extra
- * network the instance serves.
+ * `root` is `/api/v1` for the default network and `/api/v1/<name>` for every
+ * extra network the instance serves. The unversioned `/api` paths are built
+ * from the same function, so the two surfaces cannot drift apart.
  */
 function apiPaths(root: string): Record<string, PathItemObject> {
   const p = (path: string): string => `${root}${path}`;
@@ -294,7 +369,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["plans"],
         summary: "List published plans",
         description:
-          "Plans a merchant has published, newest first. Each amount is a decimal string in the plan's token's smallest unit. With `sort=subscribers` the plans are ranked by active mandates instead, most first, ties broken by plan id ascending: one page of `limit` plans, so `nextCursor` is null and `cursor` is refused.",
+          "Plans a merchant has published, newest first. Each plan includes the number of distinct subscribers with at least one active mandate. With `sort=subscribers` the plans are ranked by this maintained count, most first, ties broken by plan id ascending: one page of `limit` plans, so `nextCursor` is null and `cursor` is refused.",
         operationId: `listPlans${operationSuffix(root)}`,
         parameters: [
           merchantParameter(),
@@ -305,7 +380,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
             in: "query",
             required: false,
             description:
-              "`subscribers` ranks the plans by active mandates, most first, ties broken by plan id ascending. Absent: newest first.",
+              "`subscribers` ranks the plans by distinct active subscribers, most first, ties broken by plan id ascending. Absent: newest first.",
             schema: { type: "string", enum: ["subscribers"] },
           },
         ],
@@ -349,6 +424,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
           },
           "400": invalidRequest(),
           "404": notFound("plan_not_found", "plan"),
+          "410": errorResponse('The plan was deactivated and is gone (error.code = "plan_gone").'),
         },
       },
     },
@@ -357,7 +433,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         tags: ["plans"],
         summary: "Statistics for one plan",
         description:
-          "Active and total mandates, cancellations, the gross amount collected and the average number of settled charges per mandate.",
+          "Active and total mandates, cancellations, the gross amount collected, the average number of settled charges per mandate, and the average and median lifetime value per subscriber net of the protocol fee.",
         operationId: `getPlanStats${operationSuffix(root)}`,
         parameters: [idParameter()],
         responses: {
@@ -369,6 +445,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
           },
           "400": invalidRequest(),
           "404": notFound("plan_not_found", "plan"),
+          "410": errorResponse('The plan was deactivated and is gone (error.code = "plan_gone").'),
         },
       },
     },
@@ -489,9 +566,15 @@ function apiPaths(root: string): Record<string, PathItemObject> {
       get: {
         tags: ["mandates"],
         summary: "A mandate's settlement history",
-        description: "The charges settled for this mandate, newest first.",
+        description:
+          "The charges settled for this mandate, newest first. `from` and `to` filter by the charge's ledger close time and are both inclusive; `to` covers the whole second. Each accepts unix seconds or an ISO 8601 date/date-time. A date-only `2026-10-01` covers the whole UTC day, while `2026-10-01T12:00:00Z` is that exact instant. A `from` later than `to` is `400 invalid_request`.",
         operationId: `listMandateCharges${operationSuffix(root)}`,
-        parameters: [idParameter(), limitParameter()],
+        parameters: [
+          idParameter(),
+          limitParameter(),
+          dateBoundParameter("from", "Start of the range, inclusive. Unbounded when absent."),
+          dateBoundParameter("to", "End of the range, inclusive. Unbounded when absent."),
+        ],
         responses: {
           "200": {
             description: "The charges.",
@@ -503,6 +586,34 @@ function apiPaths(root: string): Record<string, PathItemObject> {
                     charges: { type: "array", items: { $ref: "#/components/schemas/Charge" } },
                   },
                   required: ["charges"],
+                },
+              },
+            },
+          },
+          "400": invalidRequest(),
+          "404": notFound("mandate_not_found", "mandate"),
+        },
+      },
+    },
+    [p("/mandates/{id}/attempts")]: {
+      get: {
+        tags: ["mandates"],
+        summary: "The keeper's charge attempts for a mandate",
+        description:
+          "Every attempt the keeper made to charge this mandate in the last 90 days, newest first: when, how it ended, the error code, the transaction hash and the backoff that followed. `skipped` means the vault could not cover the charge, so nothing was submitted.",
+        operationId: `listChargeAttempts${operationSuffix(root)}`,
+        parameters: [idParameter(), limitParameter()],
+        responses: {
+          "200": {
+            description: "The attempts.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    attempts: { type: "array", items: { $ref: "#/components/schemas/ChargeAttempt" } },
+                  },
+                  required: ["attempts"],
                 },
               },
             },
@@ -866,6 +977,25 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         },
       },
     },
+    [p("/merchants/{address}/cohorts")]: {
+      get: {
+        tags: ["merchants"],
+        summary: "A merchant's cohort retention",
+        description:
+          "Mandates grouped by the calendar bucket they started in, and for each cohort the share still active after 1, 2, 3... buckets: active means no cancellation, ending or completion before that bucket began. Starts and departures are bucketed by ledger close time. `limit` keeps the most recent cohorts (default 12, capped at 120); each cohort reports at most 120 periods.",
+        operationId: `getMerchantCohorts${operationSuffix(root)}`,
+        parameters: [addressParameter(), bucketParameter(), limitParameter()],
+        responses: {
+          "200": {
+            description: "The cohorts.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/MerchantCohorts" } },
+            },
+          },
+          "400": invalidRequest(),
+        },
+      },
+    },
     [p("/merchants/{address}/revenue")]: {
       get: {
         tags: ["merchants"],
@@ -943,13 +1073,56 @@ function apiPaths(root: string): Record<string, PathItemObject> {
         description:
           "What the merchant's active mandates will bring in over the next N days, net of the protocol fee. Vault funding is not modelled.",
         operationId: `getMerchantForecast${operationSuffix(root)}`,
-        parameters: [addressParameter(), daysParameter()],
+        parameters: [
+          addressParameter(),
+          daysParameter(),
+          {
+            name: "from",
+            in: "query",
+            required: false,
+            description: "Start of the forecast window as a Unix timestamp in seconds. Defaults to now.",
+            schema: { type: "integer", minimum: 0 },
+          },
+        ],
         responses: {
           "200": {
             description: "The forecast.",
             content: {
               "application/json": { schema: { $ref: "#/components/schemas/Forecast" } },
             },
+          },
+          "400": invalidRequest(),
+        },
+      },
+    },
+    [p("/subscribers/{address}/charges.csv")]: {
+      get: {
+        tags: ["subscribers"],
+        summary: "Export a subscriber's payments as CSV",
+        description:
+          "Every settled charge paid by the subscriber, oldest first, as a CSV download (`Content-Disposition: attachment`). Columns: `date` (ledger close time, ISO 8601 UTC), `merchant`, `plan` (the mandate's plan id), `amount` (what the subscriber paid, the charge amount plus the fee), `fee` (the protocol's share) and `tx_hash`. Amounts are in token units with seven decimals. The range is half-open: a charge exactly at `to` is excluded.",
+        operationId: `exportSubscriberCharges${operationSuffix(root)}`,
+        parameters: [
+          addressParameter(),
+          {
+            name: "from",
+            in: "query",
+            required: false,
+            description: "Start of the range, in unix seconds. Unbounded when absent.",
+            schema: { type: "integer", minimum: 0 },
+          },
+          {
+            name: "to",
+            in: "query",
+            required: false,
+            description: "End of the range (exclusive), in unix seconds. Unbounded when absent.",
+            schema: { type: "integer", minimum: 0 },
+          },
+        ],
+        responses: {
+          "200": {
+            description: "The payments, one per row after a header row.",
+            content: { "text/csv": { schema: { type: "string" } } },
           },
           "400": invalidRequest(),
         },
@@ -989,6 +1162,29 @@ function apiPaths(root: string): Record<string, PathItemObject> {
             },
           },
           "400": invalidRequest(),
+        },
+      },
+    },
+    [p("/subscribers/{address}/export")]: {
+      get: {
+        tags: ["subscribers"],
+        summary: "Export a subscriber's data",
+        description:
+          "Returns everything the backend holds about the subscriber — mandates, settled charges, keeper attempts, and total paid — as a JSON file download. Requires a valid SEP-10 JWT whose subject matches the `:address` path parameter.",
+        operationId: `getSubscriberExport${operationSuffix(root)}`,
+        parameters: [addressParameter()],
+        security: [{ bearerAuth: [] }],
+        responses: {
+          "200": {
+            description:
+              "The subscriber's full data export. The response carries `Content-Disposition: attachment; filename=\"payflow-export-{address}.json\"` so it saves directly in a browser.",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/SubscriberExport" } },
+            },
+          },
+          "400": invalidRequest(),
+          "401": { description: "No valid SEP-10 bearer token supplied." },
+          "403": { description: "The token's subject does not match the requested address." },
         },
       },
     },
@@ -1133,7 +1329,7 @@ function apiPaths(root: string): Record<string, PathItemObject> {
             content: { "text/event-stream": { schema: { type: "string" } } },
           },
           "400": invalidRequest(),
-          "503": errorResponse(
+          "503": transient503(
             'The concurrent stream cap was reached (error.code = "stream_limit").',
           ),
         },
@@ -1161,16 +1357,23 @@ function apiPaths(root: string): Record<string, PathItemObject> {
 }
 
 /**
- * A suffix that keeps the operation ids unique across the networks.
+ * A suffix that keeps the operation ids unique across the networks and API
+ * versions.
  *
- * The same route is served under `/api/...` and under `/api/<network>/...`;
- * OpenAPI operation ids must be unique within a document.
+ * The same route is served under `/api/v1/...` and `/api/...`, and under
+ * `/api/v1/<network>/...` and `/api/<network>/...`; OpenAPI operation ids
+ * must be unique within a document. The unversioned paths keep the ids they
+ * had before versioning, and the versioned copies carry a `V1` suffix, so an
+ * existing generated client does not have to be regenerated.
  */
 function operationSuffix(root: string): string {
-  if (root === "/api") return "";
-  const name = root.split("/").filter(Boolean).pop() ?? "";
-  if (name === "") return "";
-  return `${name[0]!.toUpperCase()}${name.slice(1)}`;
+  const rest = root.split("/").filter(Boolean);
+  if (rest[0] === "api") rest.shift();
+  const versioned = rest[0] === "v1";
+  if (versioned) rest.shift();
+  const name = rest[0] ?? "";
+  const base = name === "" ? "" : `${name[0]!.toUpperCase()}${name.slice(1)}`;
+  return versioned ? `${base}V1` : base;
 }
 
 /** The paths that do not belong to the read API. */
@@ -1226,6 +1429,36 @@ function servicePaths(): Record<string, PathItemObject> {
             description: "The service's state.",
             content: {
               "application/json": { schema: { $ref: "#/components/schemas/Health" } },
+            },
+          },
+        },
+      },
+    },
+    "/sync": {
+      get: {
+        tags: ["service"],
+        summary: "Sync badge",
+        description:
+          "Returns the last ledger the indexer has committed (`indexer_ledger`), the latest ledger the network has closed (`chain_ledger`), their difference (`lag`), and whether the indexer is within the acceptable threshold of 120 ledgers (`in_sync`). Always 200; `chain_ledger` and `lag` are null when no indexer is attached.",
+        operationId: "getSync",
+        responses: {
+          "200": {
+            description: "The indexer's sync state.",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    indexer_ledger: { type: "integer", description: "Last ledger the indexer has committed." },
+                    chain_ledger: { type: ["integer", "null"], description: "Latest ledger the network has closed; null when unavailable." },
+                    lag: { type: ["integer", "null"], description: "chain_ledger − indexer_ledger; null when chain_ledger is null." },
+                    in_sync: { type: "boolean", description: "True when lag is known and within 120 ledgers." },
+                    events_ledger: { type: "integer", description: "Last ledger the raw event stream reaches." },
+                    events_lag: { type: "integer", description: "Ledgers the projection trails the raw event stream by." },
+                  },
+                  required: ["indexer_ledger", "chain_ledger", "lag", "in_sync", "events_ledger", "events_lag"],
+                },
+              },
             },
           },
         },
@@ -1306,6 +1539,50 @@ function servicePaths(): Record<string, PathItemObject> {
         },
       },
     },
+    "/api/docs": {
+      get: {
+        tags: ["service"],
+        summary: "Human-readable API documentation",
+        description:
+          "A self-contained HTML page rendering this document with ReDoc. Its scripts are served by this process, so the page works without network access; the only CSP addition ReDoc needs is `worker-src 'self' blob:` for its search worker.",
+        operationId: "getDocs",
+        responses: {
+          "200": {
+            description: "The documentation page.",
+            content: { "text/html": { schema: { type: "string" } } },
+          },
+        },
+      },
+    },
+    "/api/docs/redoc.standalone.js": {
+      get: {
+        tags: ["service"],
+        summary: "The self-hosted ReDoc bundle",
+        description:
+          "ReDoc's standalone browser bundle, served from this process so `/api/docs` never reaches a third-party CDN.",
+        operationId: "getDocsRedocBundle",
+        responses: {
+          "200": {
+            description: "The ReDoc JavaScript bundle.",
+            content: { "text/javascript": { schema: { type: "string" } } },
+          },
+        },
+      },
+    },
+    "/api/docs/docs.js": {
+      get: {
+        tags: ["service"],
+        summary: "The documentation bootstrap",
+        description: "Points ReDoc at `/api/openapi.json`.",
+        operationId: "getDocsScript",
+        responses: {
+          "200": {
+            description: "The bootstrap JavaScript.",
+            content: { "text/javascript": { schema: { type: "string" } } },
+          },
+        },
+      },
+    },
     "/admin/reindex": {
       post: {
         tags: ["admin"],
@@ -1331,7 +1608,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("This process has no indexer to run."),
+          "503": transient503("This process has no indexer to run."),
           "500": errorResponse("The pass threw; the message is kept for the operator."),
         },
       },
@@ -1361,7 +1638,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("The keeper is not enabled."),
+          "503": transient503("The keeper is not enabled."),
           "500": errorResponse("The pass threw; the message is kept for the operator."),
         },
       },
@@ -1391,7 +1668,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("The keeper is not enabled."),
+          "503": transient503("The keeper is not enabled."),
         },
       },
     },
@@ -1421,7 +1698,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("This process has no indexer to pause."),
+          "503": transient503("This process has no indexer to pause."),
         },
       },
     },
@@ -1451,7 +1728,7 @@ function servicePaths(): Record<string, PathItemObject> {
             },
           },
           "401": errorResponse('The bearer token is missing or wrong (error.code = "unauthorized").'),
-          "503": errorResponse("This process has no indexer to resume."),
+          "503": transient503("This process has no indexer to resume."),
         },
       },
     },
@@ -1516,6 +1793,11 @@ function componentSchemas(): Record<string, SchemaObject> {
             amount: amount(),
             period: { type: "integer", description: "The billing period in seconds." },
             active: { type: "integer", description: "1 when the plan is published, 0 when it is not." },
+            activeSubscribers: {
+              type: "integer",
+              description: "Distinct subscribers with at least one active mandate on this plan.",
+            },
+            open: { type: "boolean", description: "True while the plan accepts new subscribers (`active` is 1); false once it is closed." },
             ledger: { type: "integer" },
             merchantName: {
               type: ["string", "null"],
@@ -1523,7 +1805,7 @@ function componentSchemas(): Record<string, SchemaObject> {
                 "The merchant's self-declared display name (see `/merchants/{address}/profile`); not verified. Null when the merchant has not set a profile.",
             },
           },
-          required: ["id", "merchant", "name", "token", "amount", "period", "active", "ledger"],
+          required: ["id", "merchant", "name", "token", "amount", "period", "active", "activeSubscribers", "ledger"],
         },
       ],
     },
@@ -1660,6 +1942,16 @@ function componentSchemas(): Record<string, SchemaObject> {
         totalCollected: amount(),
         totalCharges: { type: "integer" },
         averageChargesPerMandate: { type: "number" },
+        averageLtv: {
+          ...amount(),
+          description:
+            "Mean lifetime value per subscriber, net of the protocol fee: the sum of each subscriber's charge amounts on this plan, averaged over every subscriber with a mandate (one never charged counts as 0). Rounded down; \"0\" when the plan has no mandates.",
+        },
+        medianLtv: {
+          ...amount(),
+          description:
+            "Median lifetime value per subscriber, net of the protocol fee, over the same subscribers; with an even count, the mean of the middle two rounded down.",
+        },
       },
       required: [
         "planId",
@@ -1669,7 +1961,41 @@ function componentSchemas(): Record<string, SchemaObject> {
         "totalCollected",
         "totalCharges",
         "averageChargesPerMandate",
+        "averageLtv",
+        "medianLtv",
       ],
+    },
+    ChargeAttempt: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        mandateId: { type: "integer" },
+        attemptedAt: { type: "integer", description: "When the keeper made the attempt, in unix seconds." },
+        result: {
+          type: "string",
+          enum: ["settled", "failed", "skipped"],
+          description: "`skipped`: the vault could not cover the charge, so nothing was submitted.",
+        },
+        errorCode: {
+          type: ["string", "null"],
+          description:
+            "Why the attempt did not settle: an RPC status (`TRY_AGAIN_LATER`, `FAILED`, `NOT_FOUND`), a transaction result code (`txBadSeq`), a Soroban host error (`Error(Contract, #3)`), `INSUFFICIENT_BALANCE`, `CHARGE_MANY_SKIPPED` or `SUBMIT_FAILED`. Null when it settled.",
+        },
+        txHash: { type: ["string", "null"] },
+        shortfall: {
+          ...amount(),
+          description: "Only on a `skipped` attempt: what the vault was missing.",
+        },
+        failures: {
+          type: "integer",
+          description: "Consecutive failed attempts after this one; 0 once a charge settles.",
+        },
+        retryAt: {
+          type: ["integer", "null"],
+          description: "When the keeper tries again, in unix seconds; null after a settlement.",
+        },
+      },
+      required: ["id", "mandateId", "attemptedAt", "result", "errorCode", "txHash", "failures", "retryAt"],
     },
     TokenRevenue: {
       type: "object",
@@ -1700,8 +2026,13 @@ function componentSchemas(): Record<string, SchemaObject> {
         mandateCount: { type: "integer" },
         chargeCount: { type: "integer" },
         totalCollected: amount(),
+        ltv: {
+          ...amount(),
+          description:
+            "Lifetime value net of the protocol fee: what this subscriber has paid the merchant across their mandates.",
+        },
       },
-      required: ["subscriber", "mandateCount", "chargeCount", "totalCollected"],
+      required: ["subscriber", "mandateCount", "chargeCount", "totalCollected", "ltv"],
     },
     MerchantSubscribers: {
       type: "object",
@@ -1726,15 +2057,57 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["bucket", "started", "cancelled", "ended", "completed", "net"],
     },
+    /** The whole period's counts: a bucket's fields without its label. */
+    ChurnTotals: {
+      type: "object",
+      properties: {
+        started: { type: "integer" },
+        cancelled: { type: "integer" },
+        ended: { type: "integer" },
+        completed: { type: "integer" },
+        net: { type: "integer", description: "Started minus the departures." },
+      },
+      required: ["started", "cancelled", "ended", "completed", "net"],
+    },
     MerchantChurn: {
       type: "object",
       properties: {
         merchant: { type: "string", description: ADDRESS_DESCRIPTION },
         bucket: { type: "string", enum: ["day", "week", "month"] },
         buckets: { type: "array", items: { $ref: "#/components/schemas/ChurnBucket" } },
-        totals: { $ref: "#/components/schemas/ChurnBucket" },
+        totals: { $ref: "#/components/schemas/ChurnTotals" },
       },
       required: ["merchant", "bucket", "buckets", "totals"],
+    },
+    Cohort: {
+      type: "object",
+      properties: {
+        cohort: { type: "string", description: "The label of the bucket the mandates started in, in UTC." },
+        size: { type: "integer", description: "Mandates that started in the bucket." },
+        retention: {
+          type: "array",
+          description: "One entry per bucket that has begun since the cohort's, oldest first.",
+          items: {
+            type: "object",
+            properties: {
+              period: { type: "integer", minimum: 1, description: "Buckets after the cohort's own." },
+              active: { type: "integer", description: "Mandates with no departure before that bucket began." },
+              share: { type: "number", minimum: 0, maximum: 1, description: "`active` ÷ `size`." },
+            },
+            required: ["period", "active", "share"],
+          },
+        },
+      },
+      required: ["cohort", "size", "retention"],
+    },
+    MerchantCohorts: {
+      type: "object",
+      properties: {
+        merchant: { type: "string", description: ADDRESS_DESCRIPTION },
+        bucket: { type: "string", enum: ["day", "week", "month"] },
+        cohorts: { type: "array", items: { $ref: "#/components/schemas/Cohort" } },
+      },
+      required: ["merchant", "bucket", "cohorts"],
     },
     RevenueBucket: {
       type: "object",
@@ -1747,6 +2120,17 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["bucket", "gross", "fee", "net", "charges"],
     },
+    /** The whole period's money: a bucket's amounts without its label. */
+    RevenueTotals: {
+      type: "object",
+      properties: {
+        gross: amount(),
+        fee: amount(),
+        net: amount(),
+        charges: { type: "integer" },
+      },
+      required: ["gross", "fee", "net", "charges"],
+    },
     MerchantRevenue: {
       type: "object",
       properties: {
@@ -1755,7 +2139,7 @@ function componentSchemas(): Record<string, SchemaObject> {
         from: { type: ["integer", "null"], description: "Start of the range, in unix seconds." },
         to: { type: ["integer", "null"], description: "End of the range (exclusive), in unix seconds." },
         buckets: { type: "array", items: { $ref: "#/components/schemas/RevenueBucket" } },
-        totals: { $ref: "#/components/schemas/RevenueBucket" },
+        totals: { $ref: "#/components/schemas/RevenueTotals" },
       },
       required: ["merchant", "bucket", "from", "to", "buckets", "totals"],
     },
@@ -1780,6 +2164,19 @@ function componentSchemas(): Record<string, SchemaObject> {
         totalPaid: amount(),
       },
       required: ["subscriber", "mandates", "totalPaid"],
+    },
+    SubscriberExport: {
+      type: "object",
+      description: "Full data export for a subscriber (GDPR-style).",
+      properties: {
+        subscriber: { type: "string", description: ADDRESS_DESCRIPTION },
+        exportedAt: { type: "string", format: "date-time", description: "When this export was generated." },
+        mandates: { type: "array", items: { $ref: "#/components/schemas/Mandate" } },
+        charges: { type: "array", items: { $ref: "#/components/schemas/ChargeRow" } },
+        chargeAttempts: { type: "array", items: { $ref: "#/components/schemas/ChargeAttempt" } },
+        totalPaid: amount(),
+      },
+      required: ["subscriber", "exportedAt", "mandates", "charges", "chargeAttempts", "totalPaid"],
     },
     UpcomingCharge: {
       type: "object",
@@ -2024,12 +2421,21 @@ function componentSchemas(): Record<string, SchemaObject> {
       },
       required: ["bucket", "fee", "charges"],
     },
+    /** The whole period's fee revenue: a bucket's amounts without its label. */
+    ProtocolFeeTotals: {
+      type: "object",
+      properties: {
+        fee: amount(),
+        charges: { type: "integer" },
+      },
+      required: ["fee", "charges"],
+    },
     ProtocolFees: {
       type: "object",
       properties: {
         bucket: { type: "string", enum: ["day", "week", "month"] },
         buckets: { type: "array", items: { $ref: "#/components/schemas/ProtocolFeeBucket" } },
-        totals: { $ref: "#/components/schemas/ProtocolFeeBucket" },
+        totals: { $ref: "#/components/schemas/ProtocolFeeTotals" },
       },
       required: ["bucket", "buckets", "totals"],
     },
@@ -2130,6 +2536,8 @@ function componentSchemas(): Record<string, SchemaObject> {
             mismatchedEvents: { type: "integer" },
             reconciliations: { type: "integer" },
             corrections: { type: "integer" },
+            eventsLedger: { type: "integer" },
+            eventsLag: { type: "integer" },
           },
           required: ["cursor", "latestLedger", "lag", "paused"],
         },
@@ -2168,12 +2576,21 @@ function componentSchemas(): Record<string, SchemaObject> {
  * extra network the instance serves, the same paths under `/api/<name>/`.
  */
 export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
+  const service = servicePaths();
+  const legacyOpenApi = service[`${API_ALIAS}/openapi.json`];
   const paths: Record<string, PathItemObject> = {
-    ...servicePaths(),
-    ...apiPaths("/api"),
+    ...service,
+    // The document is served under both roots too, with a distinct operation
+    // id so the alias is visible to a generated client.
+    [`${API_V1}/openapi.json`]: {
+      get: { ...legacyOpenApi!.get!, operationId: "getOpenApiV1" },
+    },
+    ...apiPaths(API_V1),
+    ...apiPaths(API_ALIAS),
   };
   for (const network of options.networks) {
-    Object.assign(paths, apiPaths(`/api/${network}`));
+    Object.assign(paths, apiPaths(`${API_V1}/${network}`));
+    Object.assign(paths, apiPaths(`${API_ALIAS}/${network}`));
   }
 
   return {
@@ -2185,11 +2602,18 @@ export function buildOpenApiDocument(options: OpenApiOptions): OpenApiDocument {
       description:
         "The API serves a projection of the Payflow contracts' events: plans, mandates, the charges settled against them and the vault balances behind them.\n\n" +
         "Every amount is a decimal string in the token's smallest unit (stroops for XLM), never a JSON number, so no precision is lost. Every non-2xx response uses the same envelope, `{ \"error\": { \"code\", \"message\", \"requestId\" } }`, where `code` is stable per condition.\n\n" +
-        "When the instance serves more than one network, the same paths are also reachable under `/api/<network>/...`.\n\n" +
+        "The API is versioned: `/api/v1/...` is the canonical surface and `/api/...` is an alias of it, answered by the same router from the same projection. A breaking change goes into the next version instead of altering `/api/v1`.\n\n" +
+        "When the instance serves more than one network, the same paths are also reachable under `/api/v1/<network>/...` and `/api/<network>/...`.\n\n" +
         "What changed in the API between releases, and how long a deprecated field or route keeps working before it is removed, is recorded in [API_CHANGELOG.md](API_CHANGELOG.md).",
       license: { name: "Apache-2.0", identifier: "Apache-2.0" },
     },
-    servers: [{ url: "/", description: "This service." }],
+    servers: [
+      {
+        url: "/",
+        description:
+          "This service. API paths are absolute: /api/v1/... is the canonical versioned API and /api/... is an alias of it.",
+      },
+    ],
     tags: [
       { name: "plans", description: "Published plans." },
       { name: "mandates", description: "Subscriptions and their settlement history." },

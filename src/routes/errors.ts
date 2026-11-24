@@ -11,6 +11,7 @@ import type { Request, Response } from "express";
 export type ApiErrorCode =
   | "not_found"
   | "plan_not_found"
+  | "plan_gone"
   | "mandate_not_found"
   | "profile_not_found"
   | "invalid_ids"
@@ -19,6 +20,7 @@ export type ApiErrorCode =
   | "invalid_token_id"
   | "token_metadata_unavailable"
   | "unauthorized"
+  | "forbidden"
   | "reindex_unavailable"
   | "keeper_unavailable"
   | "indexer_unavailable"
@@ -26,6 +28,9 @@ export type ApiErrorCode =
   | "keeper_pass_failed"
   | "rate_limited"
   | "stream_limit"
+  | "prune_unavailable"
+  | "prune_failed"
+  | "audit_unavailable"
   | "internal_error";
 
 /**
@@ -74,6 +79,7 @@ export interface ApiErrorBody {
 const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   not_found: "The requested resource was not found.",
   plan_not_found: "No plan exists with that id.",
+  plan_gone: "This plan was deactivated and is no longer available.",
   mandate_not_found: "No mandate exists with that id.",
   profile_not_found: "The merchant has not set a profile.",
   invalid_ids: "The `ids` parameter must be a comma-separated list of positive integers.",
@@ -82,7 +88,11 @@ const DEFAULT_MESSAGES: Record<ApiErrorCode, string> = {
   invalid_token_id: "The token id must be `native` or a contract address.",
   token_metadata_unavailable: "The token contract's metadata could not be read; try again.",
   unauthorized: "A valid bearer token is required for this endpoint.",
+  forbidden: "You do not have permission to access this resource.",
   reindex_unavailable: "Reindexing is not available on this instance.",
+  prune_unavailable: "Data pruning is not available on this instance.",
+  prune_failed: "The prune could not be completed.",
+  audit_unavailable: "The audit log is not available on this instance.",
   keeper_unavailable: "The keeper is not available on this instance.",
   indexer_unavailable: "Runtime indexer control is not available on this instance.",
   reindex_failed: "The reindex action failed.",
@@ -124,6 +134,9 @@ export function apiErrorBody(
 /**
  * Send a structured error response. Every error path in the API funnels through
  * here so the shape, the code set, and the `requestId` stay consistent.
+ *
+ * Pass `retryAfter` (seconds) for transient 503 responses so clients know when
+ * to try again; it is set as the `Retry-After` header before the JSON body.
  */
 export function sendApiError(
   res: Response,
@@ -132,6 +145,10 @@ export function sendApiError(
   code: ApiErrorCode,
   message?: string,
   details?: ApiErrorDetail[],
+  retryAfter?: number,
 ): void {
+  if (retryAfter !== undefined && status === 503) {
+    res.set("Retry-After", String(retryAfter));
+  }
   res.status(status).json(apiErrorBody(code, requestIdOf(req), message, details));
 }

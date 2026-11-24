@@ -17,6 +17,8 @@
 > **Docs:** https://mmm-pay.github.io/payflow-docs/ ·
 > **Architecture:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
 > **Runbook:** [docs/RUNBOOK.md](docs/RUNBOOK.md) ·
+> **Threat model:** [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) ·
+> **API conventions:** [docs/API_CONVENTIONS.md](docs/API_CONVENTIONS.md) ·
 > **API changelog:** [API_CHANGELOG.md](API_CHANGELOG.md)
 
 ---
@@ -29,9 +31,13 @@ what this service is for. It does three jobs:
 
 | Component | Job |
 |---|---|
-| **Indexer** | Polls Soroban RPC for contract events and projects them into SQLite |
+| **Indexer** | Polls Soroban RPC for contract events and projects them into SQLite or PostgreSQL |
 | **Keeper** | Finds mandates that have fallen due and calls `charge` on-chain |
 | **API** | Serves the projection to the frontend over REST |
+
+### Cache
+
+Merchant summaries and token metadata are cached to reduce repeated projection and RPC work. Without `REDIS_URL`, the service uses a bounded in-memory cache per process. When `REDIS_URL` is set, it uses Redis so multiple API instances can share cache entries. Indexer event application and reconcile repairs invalidate affected merchant summary keys.
 
 ### The keeper is not a trust dependency
 
@@ -93,6 +99,10 @@ events per page; `next` is `null` at the end. The ordering is ascending by
 `(ledger, event_id)`, which is stable across re-indexes and handles multiple
 events in the same ledger. Pass the unchanged `next` value as `after` for
 the next page. Invalid parameters return `400 invalid_request`.
+A page without `name` reads at most 51 rows, seeking from the cursor through
+the `(ledger, event_id)` index, or `(contract_id, ledger, event_id)` with
+`contract`, so its cost does not grow with the size of the table. `name` is
+matched on the decoded topic, so a filtered page scans in batches of 200.
 
 An event contains `contract`, `ledger`, `txHash`, `index`, `name`,
 `topics`, `data`, and `closeTime`. `topics` is an array of base64-encoded
@@ -116,7 +126,7 @@ On multi-network deployments, the same feed is also available at
 ```bash
 npm install
 cp .env.example .env      # already points at the deployed testnet contracts
-npm test                  # 477 tests, no network needed
+npm test                  # Tests run without external network access
 npm run test:coverage     # the same tests, with a coverage report and a threshold
 npm run dev
 ```
@@ -224,6 +234,13 @@ in the builder, production dependencies only in the final image.
   applied in ledger order and the cursor advances only after a window is
   applied. Paging continues until a page is empty or passes the range end: a
   short page does not mean the range is exhausted.
+- **Catch-up progress is logged at a steady cadence.** Each time the cursor
+  moves `INDEXER_PROGRESS_LEDGERS` ledgers (default 10,000) the indexer logs
+  one `indexer progress` line with `network`, `cursor`, `latest`, `behind`,
+  the `ledgers` and `events` (and spec-`mismatched` events) since the last
+  line, and `ledgersPerSecond`. A long backfill shows movement even through
+  ranges with no events, and a caught-up indexer, which advances a few ledgers
+  per pass, stays quiet. `0` turns it off.
 - **Failing mandates back off.** A mandate whose charge fails (usually an
   empty vault) is retried after 1 minute, then 2, 4 and so on up to 6 hours. A
   success clears it. Without this, 25 underfunded mandates at the front of the
@@ -344,8 +361,11 @@ transaction would sequence against the one main account and serialize again.
 
 ## API
 
-Base path `/api`. All amounts are strings in the token's smallest unit
-(stroops for XLM) to avoid JavaScript float precision loss.
+Base path `/api/v1`. `/api` answers the same routes as an alias, so a client
+written before versioning keeps working, and a breaking change lands in
+`/api/v2` instead of altering the versioned surface underneath an existing
+client. All amounts are strings in the token's smallest unit (stroops for XLM)
+to avoid JavaScript float precision loss.
 
 `/health` is a **liveness** probe and always answers 200, so a slow backfill
 does not get the service restarted. `/ready` is a **readiness** probe: it
@@ -355,21 +375,25 @@ while the projection trails the network by more than 120 ledgers, and 200
 checks at `/ready` and liveness checks at `/health`.
 
 When extra networks are configured (see below), every route also answers under
-`/api/<network>/...` — `/api/mainnet/plans`, `/api/testnet/stats` — while
-`/api/...` keeps serving the default network unchanged.
+`/api/v1/<network>/...` — `/api/v1/mainnet/plans`, `/api/v1/testnet/stats` —
+while `/api/v1/...` keeps serving the default network unchanged. The
+unversioned `/api/<network>/...` paths remain as aliases.
 
 | Method | Path | Returns |
 |---|---|---|
 | `GET` | `/health` | Status (`starting`, `ok`, `catching_up`), indexer cursor, lag, `paused` state, data freshness (`freshnessSeconds`), spec-mismatch count, contract IDs, active RPC endpoint |
 | `GET` | `/ready` | Readiness probe: `200 ready` once caught up, `503` (`starting`/`catching_up`) while behind |
-| `GET` | `/metrics` | Prometheus metrics: the indexer's gauges and the keeper's counters (only when `METRICS_ENABLED=true`) |
+| `GET` | `/metrics` | Prometheus metrics: the indexer's gauges, the business gauges (active mandates, active merchants, MRR per network) and the keeper's counters (only when `METRICS_ENABLED=true`) |
 | `GET` | `/api/openapi.json` | The OpenAPI 3.1 description of this API |
-| `GET` | `/api/plans?merchant=&limit=&sort=` | Published plans, each with its merchant's self-declared `merchantName`; `sort=subscribers` ranks them by active mandates (ties by plan id) |
+| `GET` | `/api/docs` | Human-readable API reference, rendered by a self-hosted ReDoc bundle |
+| `GET` | `/api/plans?merchant=&limit=` | Published plans |
+| `GET` | `/api/plans?merchant=&limit=&sort=` | Published plans, each with its merchant's self-declared `merchantName` and distinct `activeSubscribers`; `sort=subscribers` ranks them by that maintained count (ties by plan id) |
 | `GET` | `/api/plans/:id` | One plan |
-| `GET` | `/api/plans/:id/stats` | Per-plan statistics: active and total mandates, cancellations, total collected, average charges per mandate |
+| `GET` | `/api/plans/:id/stats` | Per-plan statistics: active and total mandates, cancellations, total collected, average charges per mandate, average and median lifetime value per subscriber net of fee |
 | `GET` | `/api/mandates?ids=&subscriber=&merchant=&status=` | Mandates |
 | `GET` | `/api/mandates/:id` | One mandate |
-| `GET` | `/api/mandates/:id/charges` | Settlement history |
+| `GET` | `/api/mandates/:id/charges?from=&to=` | Settlement history, optionally bounded by ledger close time |
+| `GET` | `/api/mandates/:id/attempts?limit=` | The keeper's charge attempts over the last 90 days, newest first: result (`settled`, `failed`, `skipped`), error code, tx hash, vault shortfall, failure streak and next retry |
 | `GET` | `/api/stream?merchant=&subscriber=` | Server-sent `charged`, `subscribed`, `cancelled` and `mandate_ended` events (25-second heartbeat) |
 | `POST` | `/api/webhooks` | Register a URL to receive signed `charged` events; proves control of the merchant address with a signature |
 | `POST` | `/api/webhooks/:id/rotate` | Replace a webhook's signing secret; both secrets sign during the overlap |
@@ -385,11 +409,13 @@ When extra networks are configured (see below), every route also answers under
 | `GET` | `/api/merchants/:address/summary` | Active mandates, revenue, MRR and ARR |
 | `GET` | `/api/merchants/:address/profile` | The merchant's **self-declared** display name and URL, from the plan registry's `set_profile`; not verified by the contract or this API |
 | `GET` | `/api/merchants/:address/unpaid?limit=` | Due mandates the last known vault balance cannot cover (`/api/due`'s `funded: false`), with the shortfall and time overdue, longest overdue first |
-| `GET` | `/api/merchants/:address/subscribers?limit=` | The merchant's distinct subscribers, grouped by lifetime value |
+| `GET` | `/api/merchants/:address/subscribers?limit=` | The merchant's distinct subscribers, grouped by lifetime value, each with `ltv` net of fee |
 | `GET` | `/api/merchants/:address/churn?bucket=month&limit=` | Per-bucket churn: mandates started, cancelled, ended and completed, and the net |
+| `GET` | `/api/merchants/:address/cohorts?bucket=month&limit=` | Cohort retention: per signup bucket, the share of mandates still active after 1, 2, 3... buckets |
 | `GET` | `/api/merchants/:address/revenue?bucket=day&from=&to=` | Revenue over time: gross, fee and net per bucket |
 | `GET` | `/api/merchants/:address/forecast?days=30` | Projected charges over the next N days, net of fees |
 | `GET` | `/api/subscribers/:address/summary` | Mandates and total paid |
+| `GET` | `/api/subscribers/:address/charges.csv?from=&to=` | CSV of the subscriber's payments: date, merchant, plan, amount, fee and tx hash |
 | `GET` | `/api/subscribers/:address/upcoming?days=30` | Charges due over the next N days, with projected times |
 | `GET` | `/api/stats` | Protocol totals, charge volume, fees and last indexed ledger |
 
@@ -397,6 +423,19 @@ When extra networks are configured (see below), every route also answers under
 mandate ids (`?ids=1,2,3`). Ids that do not exist are omitted; more than 100
 ids returns `400` with `error.code = "too_many_ids"` and a non-numeric id
 returns `400` with `error.code = "invalid_ids"`.
+
+`/api/mandates/:id/charges` accepts `from` and `to`, either as unix seconds or
+as an ISO 8601 date/date-time (`2026-10-01` covers that whole UTC day). Both
+bounds are **inclusive**, and `to` covers the whole second. A `from` later than
+`to`, or a value that is neither form, is `400 invalid_request` with the
+parameter named in `error.details`.
+
+`/api/subscribers/:address/charges.csv` streams every payment the subscriber
+made as a CSV download, oldest first: `date`, `merchant`, `plan`, `amount`,
+`fee` and `tx_hash`. `amount` is what the subscriber paid (the charge plus the
+fee), `fee` is the protocol's share, and both have seven decimals. `plan` is
+the plan id. `from` and `to` are optional unix-second bounds, half-open like
+the merchant export.
 
 Every address the API takes is checked as a Stellar StrKey — an account
 (`G...`) or a contract (`C...`) — so a mistyped address is a `400
@@ -406,11 +445,13 @@ no merchant.
 
 ### The OpenAPI description
 
-`GET /api/openapi.json` serves an [OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0)
-document describing every route above, with the parameters each one takes, the
-responses it answers and the schema of each body. Amounts are documented as
-decimal strings in the token's smallest unit, so a generated client knows not
-to read them as numbers.
+`GET /api/v1/openapi.json` (also at `GET /api/openapi.json`) serves an
+[OpenAPI 3.1](https://spec.openapis.org/oas/v3.1.0) document describing every
+route above, with the parameters each one takes, the responses it answers and
+the schema of each body. Both the versioned paths and their unversioned
+aliases are documented. Amounts are documented as decimal strings in the
+token's smallest unit, so a generated client knows not to read them as
+numbers.
 
 The document is served by the instance it belongs to, so it lists the routes
 that instance actually has: the operator endpoints (`/admin/...`), the metrics
@@ -421,8 +462,22 @@ and each says in its description what has to be true for it to answer.
 curl -s localhost:8080/api/openapi.json | jq '.paths | keys'
 ```
 
+`GET /api/docs` renders that document in a browser. The page, its bootstrap
+and ReDoc's standalone bundle are all served by this service, so it works
+offline and needs no third-party CDN. The only CSP addition it needs is
+`worker-src 'self' blob:` for ReDoc's search worker; every other directive is
+helmet's default (`script-src 'self'`, `style-src 'self' https:
+'unsafe-inline'`, `img-src 'self' data:`).
+
 A test compares the document with the routes Express registers, so a route
 that is added without being documented fails the build.
+
+The same document is the consumer contract. `npm run schema` writes it to
+`api-schema.json`, and CI publishes that file as the `api-schema` artifact, so
+the frontend or any other consumer can validate its fixtures against exactly
+the schemas this service is tested against. `test/consumer.test.ts` does that
+for the golden response fixtures here; a field the document does not describe,
+or a required field that disappears, fails before it reaches a consumer.
 
 The document's `externalDocs` points at
 [API_CHANGELOG.md](API_CHANGELOG.md), which records what changed in the API
@@ -441,27 +496,61 @@ deployment that does not scrape them should not expose them.
 | `payflow_indexer_cursor` | gauge | The ledger up to which events have been projected |
 | `payflow_indexer_latest_ledger` | gauge | The latest ledger the RPC node reported |
 | `payflow_indexer_lag` | gauge | How many ledgers the projection trails the network by |
+| `payflow_active_mandates` | gauge | Mandates currently active in the projection |
+| `payflow_active_merchants` | gauge | Merchants with at least one active mandate |
+| `payflow_mrr` | gauge | Monthly recurring revenue of the active mandates, normalised to a 30-day month |
 | `payflow_events_applied_total` | counter | Contract events applied to the projection |
 | `payflow_charges_settled_total` | counter | Charges the keeper settled |
 | `payflow_charges_failed_total` | counter | Charges the keeper could not settle |
 | `payflow_keeper_passes_total` | counter | Keeper passes run |
 
-The three indexer gauges carry a `network` label, so an instance that serves
-testnet and mainnet reports both. The counters are the process's own totals:
+Every gauge carries a `network` label — and only that label, so the series
+stay bounded however many merchants there are — so an instance that serves
+testnet and mainnet reports both. The three business gauges are re-read from
+the projection after every indexer pass (and again before each scrape), so a
+dashboard's growth charts follow the indexer. `payflow_mrr` uses the same
+arithmetic as `GET /api/merchants/:address/summary` (`amount × 2592000 /
+period` summed over active mandates) and is exported as the exact decimal
+string the projection computed, in the token's smallest unit — an amount
+never becomes a JavaScript number. The counters are the process's own totals:
 they reset when the process restarts, which is what Prometheus expects.
 
-#### Alert rules
+#### Grafana dashboard
 
-[`deploy/prometheus/alerts.yml`](deploy/prometheus/alerts.yml) holds
-Prometheus alert rules for indexer lag, keeper failures and low keeper
-balance, webhook delivery failures and 5xx response rates. Each rule
-states its threshold and why it is that value at the top of the file; point
-Prometheus's `rule_files` at it. CI runs `promtool check rules` over it.
+[`deploy/grafana/payflow.json`](deploy/grafana/payflow.json) is a Grafana 11
+dashboard for the metrics above, so turning metrics on does not also mean
+building the dashboard from scratch.
 
-The keeper-balance, webhook-delivery and request-duration series are still
-to be instrumented, so those three rules stay inert until the corresponding
-metrics are exported; the indexer and keeper-failure rules use the metrics in
-the table above.
+To import it:
+
+1. Enable `METRICS_ENABLED=true`, point Prometheus at the service's `/metrics`
+   endpoint, and add that Prometheus to Grafana as a data source.
+2. In Grafana, open **Dashboards → New → Import**, upload
+   `deploy/grafana/payflow.json`, and pick the Prometheus data source when
+   Grafana asks for it.
+3. Select **Import**. The dashboard's `Network` variable filters every panel
+   and defaults to all networks, so one dashboard covers a single-network and a
+   multi-network deployment.
+
+The dashboard is deliberately small; each row answers one operator question.
+
+| Row | What it shows |
+|---|---|
+| Overview | Indexer lag, indexed ledger, keeper success rate, active mandates, active merchants and MRR at a glance |
+| Indexer | Lag over time, the projected cursor against the latest ledger, and events applied per second |
+| Keeper | Passes, settled and failed charges per second, the keeper failure ratio, and the process's settled/failed/pass totals |
+| Webhooks | Delivery attempts by result (delivered/failed), failed deliveries per second, and the delivery success rate |
+| HTTP requests | p50/p95/p99 request latency per route, requests per second by status, and the 5xx error ratio |
+| Business | Active mandates, active merchants and MRR per network |
+
+The dashboard is the reference consumer for the business gauges added by #166
+(`payflow_active_mandates`, `payflow_active_merchants`, `payflow_mrr`) and for
+the HTTP histogram added by #286
+(`payflow_http_request_duration_seconds{route,status}`); the webhook row reads
+`payflow_webhook_deliveries_total{result}`. Those panels stay empty until the
+corresponding instrumentation is deployed, and the rest of the dashboard works
+with the metrics in the table above. Shipping the queries now means neither
+instrumentation needs a follow-up dashboard change.
 
 ### The due list and the vault balance
 
@@ -622,6 +711,13 @@ ed25519 signature over `payflow-webhook:v1:<merchant>:<url>:<timestamp>`
 HMAC-SHA256 secret used to sign deliveries; treat it as a secret and never
 log it.
 
+Webhook targets must resolve only to public IP addresses. Registration checks
+all resolved addresses, and each delivery checks DNS again and connects to the
+checked address. Loopback, private, link-local, cloud metadata and other
+non-public addresses are rejected; redirects are not followed. Existing
+webhooks that resolve to an internal address will fail delivery until their
+target is changed to a public endpoint.
+
 Every delivery is a `POST` to the registered URL carrying:
 
 - `Idempotency-Key`: a UUID reused across retries, so receivers can collapse
@@ -690,6 +786,7 @@ the server's public key as `SIGNING_KEY` and the endpoint as
 |---|---|---|
 | `not_found` | 404 | An unknown path, or a method/path the API does not expose |
 | `plan_not_found` | 404 | `GET /api/plans/:id` or `GET /api/plans/:id/stats` with no such plan |
+| `plan_gone` | 410 | `GET /api/plans/:id` or `GET /api/plans/:id/stats` for a plan that was deactivated; a plan that never existed is `plan_not_found` (404). Plans in lists carry `open`, false once closed to new subscribers |
 | `mandate_not_found` | 404 | `GET /api/mandates/:id` or `GET /api/mandates/:id/charges` with no such mandate |
 | `profile_not_found` | 404 | `GET /api/merchants/:address/profile` for a merchant that has not set a profile |
 | `invalid_ids` | 400 | `?ids=` contains a non-positive-integer token |
@@ -767,7 +864,7 @@ re-exports the same declarations â€” types are shared, not copied, so backe
 and frontend cannot drift.
 
 ```ts
-import { PayflowClient, PayflowApiError } from "payflow-backend/client";
+import { PayflowClient, PayflowApiError } from "@mmm-pay/payflow-client";
 
 const api = new PayflowClient("http://localhost:8080");
 const { plans } = await api.plans({ merchant });
@@ -779,11 +876,19 @@ try {
 }
 ```
 
-Every endpoint is covered: `health`, `plans`, `plan`, `mandates`, `mandate`,
-`charges`, `due`, `merchantSummary`, `subscriberSummary`, `stats`. The
-package is private for now: the frontend depends on it from the repository
-(it is built by `npm run build` into `dist/client`), and publishing it to a
-registry is a release-time step for maintainers.
+Every endpoint is covered: `health`, `plans`, `plan`, `planStats`, `mandates`,
+`mandate`, `charges`, `chargeAttempts`, `due`, `merchantSummary`,
+`merchantForecast`, `merchantSubscribers`, `merchantChurn`, `merchantRevenue`,
+`subscriberSummary`, `stats`, `protocol`, `vault`, `vaultEvents`, and `keeper`.
+The client calls the versioned `/api/v1` paths; `health` stays at the service
+root.
+
+The client is published independently as
+[`@mmm-pay/payflow-client`](https://www.npmjs.com/package/@mmm-pay/payflow-client).
+It has no runtime dependencies and its own version and changelog under
+`client/`. `npm run build:client` compiles it; a `client-v*` tag runs the
+release workflow, which checks the tag against `client/package.json` and
+publishes it to npm with provenance.
 
 `tokens` breaks the same revenue down per token, joined through each charge's
 mandate and plan. With `TOKEN_ID` configured, the flat `totalCollected` and
@@ -848,6 +953,7 @@ examined without API downtime.
 | `TOKEN_ID` | — | Default token for the flat merchant-summary amounts. Unset, they span every token |
 | `NETWORKS` | *(empty)* | Extra networks to serve, comma-separated (see below) |
 | `KEEPER_ENABLED` | `false` | Turn on automatic settlement |
+| `RUN_API`, `RUN_INDEXER`, `RUN_KEEPER` | `true` | Set one to `false` to leave that part out of this process, so the API, the indexer and the keeper can run as separate processes on the same database. Only the process running the indexer takes the database lock. Several API processes need Postgres; with SQLite run one |
 | `KEEPER_DRY_RUN` | `false` | Rehearse each pass: simulate every due charge and log the outcome without signing or submitting anything |
 | `KEEPER_SECRET` | — | `S...` key that pays settlement fees. Required when the keeper is on |
 | `KEEPER_SECRET_NEXT` | — | Standby `S...` key for zero-downtime rotation; see [Rotating the keeper key](#rotating-the-keeper-key-without-downtime) |
@@ -857,17 +963,18 @@ examined without API downtime.
 | `KEEPER_MERCHANTS` | *(empty)* | Only settle mandates payable to these merchants, comma-separated `G...` addresses. Empty settles every merchant |
 | `KEEPER_FEE_PERCENTILE` | `90` | Soroban inclusion-fee percentile used for charge transactions (`50`, `60`, `70`, `80`, `90`, `95`, or `99`) |
 | `KEEPER_MAX_FEE` | `100000` | Maximum inclusion fee in stroops; congestion retries cannot exceed this cap |
-| `KEEPER_BATCH` | `true` | Use `charge_many` when supported, falling back to single charges when unavailable |
-| `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25) |
 | `KEEPER_BATCH` | `true` | Settle due mandates through the contract's `charge_many` in groups, falling back to single `charge` transactions when the contract does not support it |
 | `KEEPER_BATCH_SIZE` | `10` | Mandates per `charge_many` call (2–25); keep it at or below the contract's list cap |
 | `INDEXER_INTERVAL_MS` | `10000` | Indexing poll interval |
 | `INDEXER_FETCH_CONCURRENCY` | `4` | Ledger windows one pass may fetch at once (max 16). Applied in order; `1` is sequential |
+| `INDEXER_PROGRESS_LEDGERS` | `10000` | Ledgers between two `indexer progress` log lines (cursor, lag, events, ledgers per second); `0` turns them off |
 | `INDEXER_START_LEDGER` | `0` | Where to start with no saved cursor. `0` starts from the oldest ledger RPC still serves |
 | `RECONCILE_INTERVAL_MS` | `600000` | How often the reconciler re-checks a sample of active mandates against the contract state, in ms |
 | `ARCHIVE_URL` | *(empty)* | Full-history archive URL used to backfill the gap between the stored cursor and the oldest ledger the RPC still serves |
 | `ALLOW_GAPS` | `false` | Advance the cursor past a gap the RPC cannot serve, accepting lost history; without it the indexer refuses to advance past a gap |
 | `RECONCILE_SAMPLE_SIZE` | `25` | Active mandates sampled per reconcile pass; each sample costs one read-only RPC simulation |
+| `DATABASE_URL` | — | `postgres://` or `postgresql://` connection string; when set, PostgreSQL is used instead of SQLite |
+| `REDIS_URL` | — | Optional `redis://`/`rediss://` shared cache for merchant summaries and token metadata; defaults to in-memory cache |
 | `DATABASE_PATH` | `./payflow.db` | SQLite file |
 | `PORT` | `8080` | HTTP port |
 | `API_RATE_LIMIT_WINDOW_MS` | `60000` | Per-IP API rate-limit window in milliseconds |
@@ -927,13 +1034,15 @@ MAINNET_SUBSCRIPTION_ID=C...
 MAINNET_INDEXER_START_LEDGER=5110418
 ```
 
-Each network runs its own indexer with its own cursor and its own SQLite
-database — derived from `DATABASE_PATH` (`./payflow.db` becomes
-`./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise — so
-ledger numbers, replay windows and outages on one network never affect the
-other. Unprefixed `/api/...` routes always serve the default network
-(`STELLAR_NETWORK`); everything is also reachable under `/api/<name>/...`. The
-keeper settles the default network only.
+Each network runs its own indexer with its own cursor and projection. With
+`DATABASE_URL`, each network is isolated in its own PostgreSQL schema; otherwise
+it uses a SQLite file derived from `DATABASE_PATH` (`./payflow.db` becomes
+`./payflow-mainnet.db`) unless `<NAME>_DATABASE_PATH` says otherwise. Ledger
+numbers, replay windows and outages on one network never affect the other.
+The unprefixed `/api/v1/...` routes always serve the default network
+(`STELLAR_NETWORK`), and everything is also reachable under
+`/api/v1/<name>/...`; the unversioned `/api/...` and `/api/<name>/...` paths
+are aliases. The keeper settles the default network only.
 
 
 ## Deployment
@@ -942,7 +1051,8 @@ keeper settles the default network only.
 `/health` as the health check. The free plan has no disk, so the SQLite
 projection is rebuilt from `INDEXER_START_LEDGER` after each restart, which
 takes seconds while the deployment ledger is within RPC retention (about 7
-days on testnet). On a paid plan, add a disk and point `DATABASE_PATH` at it.
+days on testnet). Use `DATABASE_URL` for persistent PostgreSQL storage and
+horizontal API instances, or add a disk and point `DATABASE_PATH` at it.
 
 **Keeper.** [`.github/workflows/keeper.yml`](.github/workflows/keeper.yml)
 settles due testnet mandates roughly every 15 minutes from GitHub Actions,
@@ -1003,7 +1113,9 @@ Dependabot keeps dependencies current. Changes are recorded in
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Unaudited, testnet only.
+See [SECURITY.md](SECURITY.md). Unaudited, testnet only. The API's trust
+boundaries, authentication model and known risks are in
+[docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 
 ## Maintainers
 

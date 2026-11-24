@@ -11,6 +11,9 @@ import {
 } from "@stellar/stellar-sdk";
 import { big, num } from "./lib/stellar.ts";
 import { logger } from "./lib/logger.ts";
+import { asStorage } from "./lib/store/index.ts";
+import type { Storage } from "./lib/store/types.ts";
+import { updateActivePlanSubscriber } from "./lib/plan-subscribers.ts";
 
 /** One mandate's state as the subscription contract reports it. Amounts stay strings. */
 export interface ChainMandate {
@@ -70,7 +73,7 @@ const SIMULATION_FEE = "100";
  * the next pass — it never crashes the loop.
  */
 export class Reconciler {
-  private readonly db: DatabaseSync;
+  private readonly db: Storage;
   private readonly server: ReconcileRpc;
   private readonly subscriptionId: string;
   private readonly networkPassphrase: string;
@@ -84,14 +87,14 @@ export class Reconciler {
   private running = false;
 
   constructor(
-    db: DatabaseSync,
+    db: Storage | DatabaseSync,
     server: ReconcileRpc,
     subscriptionId: string,
     networkPassphrase: string,
     sampleSize: number,
     invalidateMerchant?: (merchant: string) => void,
   ) {
-    this.db = db;
+    this.db = asStorage(db);
     this.server = server;
     this.subscriptionId = subscriptionId;
     this.networkPassphrase = networkPassphrase;
@@ -117,28 +120,34 @@ export class Reconciler {
       // Indexed on (status, ...): active mandates only, bounded by the sample.
       // Deterministic by id keeps the query short; drift on newer mandates is
       // caught as they are created and sampled on later passes.
-      const ids = this.db
-        .prepare(`SELECT id FROM mandates WHERE status = 'Active' ORDER BY id LIMIT ?`)
-        .all(this.sampleSize) as { id: number }[];
+      const ids = await this.db.all<{ id: number }>(
+        "SELECT id FROM mandates WHERE status = 'Active' ORDER BY id LIMIT ?",
+        [this.sampleSize],
+      );
       result.sampled = ids.length;
       if (ids.length === 0) return result;
 
       const rows = new Map<
         number,
-        { status: string; charges_made: number; next_charge: number; merchant: string }
+        {
+          status: string;
+          charges_made: number;
+          next_charge: number;
+          merchant: string;
+          plan_id: number;
+          subscriber: string;
+        }
       >();
-      for (const row of this.db
-        // The interpolation builds nothing but `?` placeholders — one per
-        // sampled id — so the query is fully parameterised and safe.
-        // eslint-disable-next-line no-restricted-syntax
-        .prepare(`SELECT id, status, charges_made, next_charge, merchant FROM mandates WHERE id IN (${ids.map(() => "?").join(",")})`)
-        .all(...ids.map(({ id }) => id)) as Array<{
+      const placeholders = ids.map(() => "?").join(",");
+      for (const row of await this.db.all<{
           id: number;
           status: string;
           charges_made: number;
           next_charge: number;
           merchant: string;
-        }>) {
+          plan_id: number;
+          subscriber: string;
+        }>(`SELECT id, status, charges_made, next_charge, merchant, plan_id, subscriber FROM mandates WHERE id IN (${placeholders})`, ids.map(({ id }) => id))) {
         rows.set(row.id, row);
       }
 
@@ -187,8 +196,23 @@ export class Reconciler {
         for (const d of drift) {
           // `d.field` is one of three hard-coded column names, never user input,
           // so the interpolation is a vetted static fragment.
-          // eslint-disable-next-line no-restricted-syntax
-          this.db.prepare(`UPDATE mandates SET ${d.field} = ? WHERE id = ?`).run(d.chain, id);
+          let applied = true;
+          await this.db.transaction(async (storage) => {
+            if (d.field === "status") {
+              const changed = await storage.get<{ id: number }>(
+                "UPDATE mandates SET status = ? WHERE id = ? AND status = ? RETURNING id",
+                [d.chain, id, row.status],
+              );
+              if (!changed) {
+                applied = false;
+                return;
+              }
+              await updateActivePlanSubscriber(storage, row, { ...row, status: String(d.chain) });
+            } else {
+              await storage.run(`UPDATE mandates SET ${d.field} = ? WHERE id = ?`, [d.chain, id]);
+            }
+          });
+          if (!applied) continue;
           result.corrections += 1;
           this.invalidateMerchant?.(row.merchant);
           logger.info(

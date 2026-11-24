@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import type { Storage } from "./store/types.ts";
 
 /**
  * Schema notes.
@@ -18,6 +19,10 @@ import { DatabaseSync } from "node:sqlite";
  * of the event. It is keyed on (mandate_id, slot) and written with
  * INSERT OR IGNORE, so replaying a ledger range cannot record the same
  * event — or the same departure — twice.
+ *
+ * Schema changes are forward-only. Startup migrations add columns and indexes
+ * without dropping or rewriting existing data; changes that cannot follow that
+ * rule need a separately planned migration and rollout.
  */
 const SCHEMA = `
 
@@ -72,6 +77,20 @@ CREATE TABLE IF NOT EXISTS mandates (
 CREATE INDEX IF NOT EXISTS mandates_subscriber ON mandates(subscriber);
 CREATE INDEX IF NOT EXISTS mandates_merchant   ON mandates(merchant);
 CREATE INDEX IF NOT EXISTS mandates_due        ON mandates(status, next_charge);
+
+-- Distinct subscribers with at least one active mandate per plan. The
+-- membership rows let the indexer handle multiple mandates by one subscriber
+-- without rescanning the mandates table; the count is read directly by plans.
+CREATE TABLE IF NOT EXISTS plan_active_subscribers (
+  plan_id       INTEGER NOT NULL,
+  subscriber    TEXT    NOT NULL,
+  mandate_count INTEGER NOT NULL,
+  PRIMARY KEY (plan_id, subscriber)
+);
+CREATE TABLE IF NOT EXISTS plan_subscriber_counts (
+  plan_id           INTEGER PRIMARY KEY,
+  active_subscribers INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS charges (
   tx_hash      TEXT    NOT NULL,
@@ -215,6 +234,29 @@ CREATE TABLE IF NOT EXISTS webhook_attempts (
 );
 CREATE INDEX IF NOT EXISTS webhook_attempts_webhook ON webhook_attempts(webhook_id, id);
 
+-- One row per keeper charge attempt (#144): when it ran, how it ended
+-- ('settled', 'failed', or 'skipped' when the vault could not cover the
+-- charge), the error code and the transaction hash. "failures" is the
+-- mandate's consecutive-failure streak after the attempt (0 once it settles)
+-- and "retry_at" when the keeper tries again, so a mandate's newest row is its
+-- whole backoff state and a restart resumes it. Operational, not a projection:
+-- a reindex keeps it, and the keeper prunes rows older than 90 days.
+CREATE TABLE IF NOT EXISTS charge_attempts (
+  id           INTEGER PRIMARY KEY,
+  mandate_id   INTEGER NOT NULL,
+  attempted_at INTEGER NOT NULL,   -- unix seconds
+  result       TEXT    NOT NULL,   -- 'settled' | 'failed' | 'skipped'
+  error_code   TEXT,
+  tx_hash      TEXT,
+  -- What the vault was missing, for a 'skipped' attempt: a decimal string in
+  -- the token's smallest unit.
+  shortfall    TEXT,
+  failures     INTEGER NOT NULL,
+  retry_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS charge_attempts_mandate ON charge_attempts(mandate_id, id);
+CREATE INDEX IF NOT EXISTS charge_attempts_attempted_at ON charge_attempts(attempted_at);
+
 -- Contract upgrade history. Records when contracts are upgraded with new code.
 CREATE TABLE IF NOT EXISTS contract_upgrades (
   contract_id TEXT    NOT NULL,
@@ -227,12 +269,38 @@ CREATE TABLE IF NOT EXISTS contract_upgrades (
 );
 CREATE INDEX IF NOT EXISTS contract_upgrades_contract ON contract_upgrades(contract_id, ledger DESC);
 CREATE INDEX IF NOT EXISTS contract_upgrades_ledger ON contract_upgrades(ledger DESC);
+
+-- Audit log for admin actions: tracks who did what and when.
+-- The subject field identifies the entity being acted on (e.g. mandate ID, webhook ID).
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id          INTEGER PRIMARY KEY,
+  action      TEXT    NOT NULL,
+  subject     TEXT,
+  details     TEXT    NOT NULL DEFAULT '{}',
+  success     INTEGER NOT NULL,
+  error_msg   TEXT,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_logs_action ON audit_logs(action, created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_logs_created_at ON audit_logs(created_at DESC);
+
+-- Track past-due mandates: mandates that were due but not yet charged.
+-- The is_past_due flag marks a mandate as past its due date.
+-- This is updated by the indexer and keeper to track mandates that should have been charged.
+CREATE TABLE IF NOT EXISTS past_due_mandates (
+  mandate_id INTEGER PRIMARY KEY,
+  first_past_due_at INTEGER NOT NULL,
+  last_checked_at INTEGER NOT NULL,
+  still_past_due INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS past_due_mandates_first_past_due ON past_due_mandates(first_past_due_at DESC);
 `;
 
 /**
- * Columns added after the first deployment. CREATE TABLE IF NOT EXISTS leaves
- * an existing table alone, so new columns have to be added explicitly. Each
- * entry is applied only when absent, which keeps repeated startups a no-op.
+ * Forward-only columns added after the first deployment. CREATE TABLE IF
+ * NOT EXISTS leaves an existing table alone, so new columns have to be added
+ * explicitly. Each entry is applied only when absent, keeping repeated
+ * startups a no-op.
  */
 const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]> = [
   ["plans", "name", "TEXT NOT NULL DEFAULT ''"],
@@ -243,11 +311,12 @@ const ADDED_COLUMNS: ReadonlyArray<[table: string, column: string, decl: string]
 ];
 
 /**
- * Indexes added after the first deployment. Each is created only when its
- * table exists (a migration may run against a partially built database) and
- * `IF NOT EXISTS` keeps repeated startups a no-op. These are covering indexes
- * for the merchant and subscriber summary routes: the aggregates read only
- * the indexed columns, so the planner never touches the table b-tree.
+ * Forward-only indexes added after the first deployment. Each is created
+ * only when its table exists (a migration may run against a partially built
+ * database), and `IF NOT EXISTS` keeps repeated startups a no-op. These are
+ * covering indexes for the merchant and subscriber summary routes: the
+ * aggregates read only the indexed columns, so the planner never touches the
+ * table b-tree.
  */
 const ADDED_INDEXES: ReadonlyArray<[table: string, name: string, columns: string]> = [
   ["mandates", "mandates_merchant_status_period_amount", "merchant, status, period, amount"],
@@ -257,8 +326,13 @@ const ADDED_INDEXES: ReadonlyArray<[table: string, name: string, columns: string
   // and buckets them by their close time, so the range filter is served from
   // the index rather than from a scan of the merchant's whole history.
   ["charges", "charges_merchant_created_at", "merchant, created_at"],
-  // Ranking plans by active mandates counts each plan's active mandates with
-  // one covering range lookup instead of a scan of every mandate.
+  // A mandate's charge history can be filtered by close time, so the range
+  // is served from the index rather than from the mandate's whole history.
+  ["charges", "charges_mandate_created_at", "mandate_id, created_at"],
+  // The subscriber CSV streams one subscriber's charges in close-time order,
+  // the same keyset pattern as the merchant export.
+  ["charges", "charges_subscriber_created_at", "subscriber, created_at"],
+  // Per-plan statistics filter mandates by plan and status.
   ["mandates", "mandates_plan_status", "plan_id, status"],
   // The protocol fee report finds the newest charge and reads only the
   // charges inside its bucket window, straight from the index.
@@ -266,9 +340,26 @@ const ADDED_INDEXES: ReadonlyArray<[table: string, name: string, columns: string
   // A merchant's unpaid report walks its due mandates oldest-due first, so
   // the range and the order both come from the index.
   ["mandates", "mandates_merchant_status_next_charge", "merchant, status, next_charge"],
+  // The raw event feed filtered by contract walks one contract's events in
+  // (ledger, event_id) order from the page cursor, so the range, the filter
+  // and the order all come from the index instead of every contract's rows.
+  ["events", "events_contract_ledger", "contract_id, ledger, event_id"],
 ];
 
 export function migrate(db: DatabaseSync): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS plan_active_subscribers (
+      plan_id INTEGER NOT NULL,
+      subscriber TEXT NOT NULL,
+      mandate_count INTEGER NOT NULL,
+      PRIMARY KEY (plan_id, subscriber)
+    );
+    CREATE TABLE IF NOT EXISTS plan_subscriber_counts (
+      plan_id INTEGER PRIMARY KEY,
+      active_subscribers INTEGER NOT NULL
+    );
+  `);
+
   for (const [table, column, decl] of ADDED_COLUMNS) {
     const columns = db.prepare(`SELECT name FROM pragma_table_info(?)`).all(table) as {
       name: string;
@@ -286,6 +377,22 @@ export function migrate(db: DatabaseSync): void {
       .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(table);
     if (exists) db.exec(`CREATE INDEX IF NOT EXISTS ${name} ON ${table}(${columns})`);
+  }
+
+  // Seed these additive projections for databases created before the tables
+  // existed. INSERT OR IGNORE makes startup repeatable without overwriting
+  // counts already maintained by the indexer.
+  const mandateColumns = db.prepare("SELECT name FROM pragma_table_info('mandates')").all() as {
+    name: string;
+  }[];
+  if (["plan_id", "subscriber", "status"].every((name) => mandateColumns.some((column) => column.name === name))) {
+    db.exec(`
+      INSERT OR IGNORE INTO plan_active_subscribers (plan_id, subscriber, mandate_count)
+      SELECT plan_id, subscriber, COUNT(*) FROM mandates
+       WHERE status = 'Active' GROUP BY plan_id, subscriber;
+      INSERT OR IGNORE INTO plan_subscriber_counts (plan_id, active_subscribers)
+      SELECT plan_id, COUNT(*) FROM plan_active_subscribers GROUP BY plan_id;
+    `);
   }
 }
 
@@ -352,11 +459,82 @@ export function saveContractUpgrade(db: DatabaseSync, upgrade: ContractUpgrade):
 }
 
 export function clearProjections(db: DatabaseSync): void {
-  // Do not remove cursor, raw events, or operational webhook configuration.
+  // Do not remove cursor, raw events, operational webhook configuration, or audit logs.
   for (const table of [
     "plans", "mandates", "charges", "vault_events", "fee_history", "mandate_events", "mandate_timeline", "contract_upgrades",
-    "merchant_profiles",
+    "merchant_profiles", "past_due_mandates",
   ]) {
     db.exec(`DELETE FROM ${table}`);
   }
+}
+
+export interface AuditLogEntry {
+  action: string;
+  subject?: string | undefined;
+  details?: Record<string, unknown> | undefined;
+  success: boolean;
+  errorMsg?: string | undefined;
+}
+
+export async function logAuditEvent(db: Storage, entry: AuditLogEntry): Promise<void> {
+  await db.run(`INSERT INTO audit_logs
+    (action, subject, details, success, error_msg, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)`, [
+    entry.action,
+    // SQLite takes NULL, not undefined, for an absent value.
+    entry.subject ?? null,
+    JSON.stringify(entry.details ?? {}),
+    entry.success ? 1 : 0,
+    entry.errorMsg ?? null,
+    Math.floor(Date.now() / 1000),
+  ]);
+}
+
+export async function pruneOldEvents(db: Storage, daysToKeep: number = 30): Promise<number> {
+  const cutoffTime = Math.floor((Date.now() - daysToKeep * 24 * 60 * 60 * 1000) / 1000);
+  // `RETURNING` reports the deleted rows on both backends, so the count needs
+  // no second statement: node:sqlite's `changes` is not on the Storage boundary.
+  const deleted = await db.all<{ event_id: string }>(
+    "DELETE FROM events WHERE close_time IS NOT NULL AND close_time < ? RETURNING event_id",
+    [cutoffTime],
+  );
+  return deleted.length;
+}
+
+export async function pruneChargeAttempts(db: Storage, daysToKeep: number = 90): Promise<number> {
+  if (daysToKeep === 0) return 0;
+  const cutoffTime = Math.floor((Date.now() - daysToKeep * 24 * 60 * 60 * 1000) / 1000);
+  const deleted = await db.all<{ id: number }>(
+    "DELETE FROM charge_attempts WHERE attempted_at < ? RETURNING id",
+    [cutoffTime],
+  );
+  return deleted.length;
+}
+
+export function markMandateAsPastDue(db: DatabaseSync, mandateId: number): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(`INSERT INTO past_due_mandates (mandate_id, first_past_due_at, last_checked_at, still_past_due)
+    VALUES (?, ?, ?, 1)
+    ON CONFLICT(mandate_id) DO UPDATE SET
+      last_checked_at = excluded.last_checked_at,
+      still_past_due = 1`).run(mandateId, now, now);
+}
+
+export function clearMandateAsPastDue(db: DatabaseSync, mandateId: number): void {
+  db.prepare(`UPDATE past_due_mandates SET still_past_due = 0 WHERE mandate_id = ?`).run(mandateId);
+}
+
+export async function getPastDueMandates(db: Storage): Promise<Array<{ mandate_id: number; first_past_due_at: number }>> {
+  return db.all<{ mandate_id: number; first_past_due_at: number }>(
+    "SELECT mandate_id, first_past_due_at FROM past_due_mandates WHERE still_past_due = 1 ORDER BY first_past_due_at ASC",
+  );
+}
+
+/** Back up the database to `backupPath` with a transactionally consistent snapshot. */
+export function backupDatabase(db: DatabaseSync, backupPath: string): void {
+  // Checkpoint the WAL so the main file holds all committed data before we
+  // copy it; `VACUUM INTO` then produces a self-contained, consistent
+  // database file at `backupPath` while the live database keeps running.
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
 }

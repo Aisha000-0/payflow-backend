@@ -46,6 +46,10 @@ export interface PlanRow extends TokenFields {
   amount: string;
   period: number;
   active: number;
+  /** Distinct subscribers with at least one active mandate on this plan. */
+  activeSubscribers: number;
+  /** True while the plan accepts new subscribers (`active` is 1). */
+  open?: boolean;
   ledger: number;
   /**
    * The merchant's self-declared display name (see {@link MerchantProfile});
@@ -176,6 +180,39 @@ export interface PlanStatsResponse {
   totalCharges: number;
   /** Mean settled charges per mandate (plain division; 0 when no mandates). */
   averageChargesPerMandate: number;
+  /**
+   * Mean lifetime value per subscriber, net of the protocol fee: what one
+   * subscriber has paid the merchant through this plan. Every subscriber with
+   * a mandate counts. Decimal string in the token's smallest unit, rounded
+   * down; "0" when the plan has no mandates.
+   */
+  averageLtv: string;
+  /** Median lifetime value per subscriber, same units; the floored mean of the middle two when even. */
+  medianLtv: string;
+}
+
+/** One keeper attempt to charge a mandate. */
+export interface ChargeAttemptRow {
+  id: number;
+  mandateId: number;
+  /** When the keeper made the attempt, in unix seconds. */
+  attemptedAt: number;
+  /** `skipped`: the vault could not cover the charge, so nothing was submitted. */
+  result: "settled" | "failed" | "skipped";
+  /** Why it did not settle: an RPC status, a transaction result code or a host error. */
+  errorCode: string | null;
+  txHash: string | null;
+  /** For a `skipped` attempt: what the vault was missing, token's smallest unit. */
+  shortfall?: string;
+  /** Consecutive failed attempts after this one; 0 once a charge settles. */
+  failures: number;
+  /** When the keeper tries again, in unix seconds; null after a settlement. */
+  retryAt: number | null;
+}
+
+export interface ChargeAttemptPage {
+  /** Newest first. */
+  attempts: ChargeAttemptRow[];
 }
 
 export interface MandatePage {
@@ -322,6 +359,19 @@ export interface SubscriberSummary {
   totalPaid: string;
 }
 
+/** Full GDPR-style data export for one subscriber. */
+export interface SubscriberExport {
+  subscriber: string;
+  exportedAt: string;
+  mandates: MandateRow[];
+  /** Every settled charge, oldest first. */
+  charges: ChargeRow[];
+  /** Every keeper attempt for every mandate, newest first per mandate. */
+  chargeAttempts: ChargeAttemptRow[];
+  /** Sum of (amount + fee) across all settled charges, token's smallest unit. */
+  totalPaid: string;
+}
+
 /** One subscriber of a merchant, grouped across all of that subscriber's mandates with the merchant. */
 export interface MerchantSubscriber {
   /** Subscriber address. */
@@ -330,8 +380,15 @@ export interface MerchantSubscriber {
   mandateCount: number;
   /** Charges settled from this subscriber to this merchant. */
   chargeCount: number;
-  /** Lifetime value: gross amount collected from this subscriber, token's smallest unit. */
+  /** Sum of the charge amounts collected from this subscriber, token's smallest unit. */
   totalCollected: string;
+  /**
+   * Lifetime value net of the protocol fee: what this subscriber has paid the
+   * merchant, token's smallest unit. A charge's `amount` is already the
+   * merchant's share, so this equals `totalCollected`; `ltv` is the field
+   * that names it.
+   */
+  ltv: string;
 }
 
 export interface MerchantSubscribersResponse {
@@ -370,6 +427,34 @@ export interface MerchantChurnResponse {
   buckets: ChurnBucket[];
   /** The same counts summed over every bucket in the report. */
   totals: Omit<ChurnBucket, "bucket">;
+}
+
+/** How much of a cohort was still active a number of buckets after it started. */
+export interface CohortRetention {
+  /** Buckets after the cohort's own: 1 is the start of the next bucket. */
+  period: number;
+  /** Mandates of the cohort with no departure before that instant. */
+  active: number;
+  /** `active` ÷ the cohort's size, from 0 to 1. */
+  share: number;
+}
+
+/** The mandates that started in one bucket. */
+export interface Cohort {
+  /** The bucket's label, as in the churn report. All in UTC. */
+  cohort: string;
+  /** Mandates that started in the bucket. */
+  size: number;
+  /** One entry per bucket that has begun since, oldest first. */
+  retention: CohortRetention[];
+}
+
+export interface MerchantCohortsResponse {
+  merchant: string;
+  /** The bucket size cohorts and periods are measured in. */
+  bucket: ChurnBucketSize;
+  /** Cohorts with at least one mandate, oldest first. */
+  cohorts: Cohort[];
 }
 
 /**
@@ -554,6 +639,10 @@ export interface HealthResponse {
     reconciliations: number;
     /** Mandate rows the reconciler has brought back in line with the chain. */
     corrections: number;
+    /** Last ledger the raw event stream reaches. */
+    eventsLedger: number;
+    /** Ledgers the projection trails the raw event stream by. */
+    eventsLag: number;
   } | null;
   rpc?: {
     active: string;
@@ -565,6 +654,30 @@ export interface HealthResponse {
     subscription: string;
   };
   networks?: Record<string, HealthResponse>;
+}
+
+/**
+ * `GET /sync`: how far behind the indexer is relative to the tip of the chain.
+ *
+ * `indexer_ledger` is the last ledger the indexer has fully processed;
+ * `chain_ledger` is the latest ledger the network has closed. When the
+ * indexer status is not available (a read-only replica with no attached
+ * indexer, for example) `chain_ledger` and `lag` are null and `in_sync` is
+ * false — the caller should fall back to `/health` for a richer picture.
+ */
+export interface SyncResponse {
+  /** Last ledger the indexer has committed to the projection. */
+  indexer_ledger: number;
+  /** Latest ledger the network has closed; null when unavailable. */
+  chain_ledger: number | null;
+  /** `chain_ledger − indexer_ledger`; null when `chain_ledger` is null. */
+  lag: number | null;
+  /** True when `lag` is known and within the acceptable threshold (120 ledgers). */
+  in_sync: boolean;
+  /** Last ledger the raw event stream reaches. */
+  events_ledger: number;
+  /** Ledgers the projection trails the raw event stream by. */
+  events_lag: number;
 }
 
 /**

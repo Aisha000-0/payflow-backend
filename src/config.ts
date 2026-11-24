@@ -37,6 +37,14 @@ const optionalSecret = z
     (value) => value === undefined || StrKey.isValidEd25519SecretSeed(value),
     "must be a valid Stellar secret seed",
   );
+const postgresUrl = z.preprocess(
+  (value) => (value === "" ? undefined : value),
+  z
+    .string()
+    .url()
+    .refine((value) => ["postgres:", "postgresql:"].includes(new URL(value).protocol), "must use a postgres URL")
+    .optional(),
+);
 
 const adminTokensSchema = z.array(
   z.object({
@@ -181,19 +189,40 @@ const schema = z.object({
    * this to 1 for strictly sequential reads.
    */
   INDEXER_FETCH_CONCURRENCY: z.coerce.number().int().positive().max(16).default(4),
+  /**
+   * How many ledgers the indexer advances between two `indexer progress`
+   * log lines. A catch-up over a long range is otherwise silent between
+   * passes that apply no events; this gives operators a steady heartbeat of
+   * cursor, lag and rate. `0` turns the progress log off.
+   */
+  INDEXER_PROGRESS_LEDGERS: z.coerce.number().int().nonnegative().default(10_000),
+
+  /**
+   * Days to retain raw contract events before pruning. Events older than this
+   * are removed by the prune operation. Set to 0 to keep all events indefinitely.
+   * @deprecated Use RAW_EVENT_RETENTION_DAYS for per-table control.
+   */
+  DATA_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(30),
+  /**
+   * Days to retain raw contract events (`events` table). Overrides
+   * `DATA_RETENTION_DAYS` when set. Set to 0 to keep events indefinitely.
+   */
+  RAW_EVENT_RETENTION_DAYS: z.coerce.number().int().nonnegative().optional(),
+  /**
+   * Days to retain keeper charge-attempt logs (`charge_attempts` table).
+   * Attempts older than this are pruned automatically on each keeper pass and
+   * on demand via the admin prune endpoint. Set to 0 to keep all logs.
+   */
+  CHARGE_ATTEMPT_RETENTION_DAYS: z.coerce.number().int().nonnegative().default(90),
 
   PORT: z.coerce.number().int().positive().default(8080),
   API_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60_000),
   API_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),
-  /**
-   * Serve the Prometheus endpoint at `/metrics`. Off by default: the metrics
-   * are operational data, and a deployment that does not scrape them should
-   * not expose them.
-   */
   METRICS_ENABLED: z
     .string()
     .default("false")
-    .transform((v) => v === "true"),
+    .transform((value) => value === "true"),
+  DATABASE_URL: postgresUrl,
   DATABASE_PATH: z.string().default("./payflow.db"),
   CORS_ORIGIN: z.string().default("*"),
   LOG_LEVEL: z.string().default("info"),
@@ -205,6 +234,11 @@ const schema = z.object({
     .optional()
     .transform((value) => (value === "" ? undefined : value)),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000),
+  REDIS_URL: z
+    .string()
+    .optional()
+    .transform((value) => (value === "" ? undefined : value))
+    .refine((value) => value === undefined || isHttpUrl(value) || value.startsWith("redis://") || value.startsWith("rediss://"), "must be a redis(s) URL"),
 
   ADMIN_TOKEN: z.string().optional(),
   /**
@@ -280,12 +314,16 @@ export interface NetworkConfig {
   defaultToken?: string | undefined;
   /** Where the indexer starts when its database has no cursor. */
   startLedger: number;
-  /** SQLite file holding this network's projection. */
+  /** SQLite file holding this network's projection when DATABASE_URL is unset. */
   databasePath: string;
+  /** Shared PostgreSQL server, isolated by per-network schema when configured. */
+  databaseUrl?: string | undefined;
   /** Full-history archive URL used to backfill a detected gap. */
   archiveUrl?: string | undefined;
   /** Advance the cursor past a gap the RPC cannot serve. */
   allowGaps?: boolean | undefined;
+  /** Ledgers between two `indexer progress` log lines; 0 turns them off. */
+  progressLedgers?: number | undefined;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -341,12 +379,14 @@ export function networkConfigs(config: Config, env: NodeJS.ProcessEnv = process.
       subscriptionId: config.SUBSCRIPTION_ID,
       startLedger: config.INDEXER_START_LEDGER,
       databasePath: config.DATABASE_PATH,
+      databaseUrl: config.DATABASE_URL,
     },
     ...names.map((name) => extraNetwork(name, config, env)),
   ].map((network) => ({
     ...network,
     archiveUrl: config.ARCHIVE_URL,
     allowGaps: config.ALLOW_GAPS,
+    progressLedgers: config.INDEXER_PROGRESS_LEDGERS,
   }));
 }
 
@@ -380,6 +420,7 @@ function extraNetwork(name: string, base: Config, env: NodeJS.ProcessEnv): Netwo
     startLedger: Number(data[`${prefix}_INDEXER_START_LEDGER`] ?? 0),
     databasePath:
       databasePath === undefined ? databasePathFor(base.DATABASE_PATH, name) : String(databasePath),
+    databaseUrl: base.DATABASE_URL,
   };
 }
 

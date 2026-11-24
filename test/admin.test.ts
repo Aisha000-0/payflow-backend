@@ -45,12 +45,12 @@ const call = async (
   method: string,
   path: string,
   token?: string,
-): Promise<{ status: number; body: Record<string, unknown> }> => {
+): Promise<{ status: number; body: Record<string, unknown>; headers: Headers }> => {
   const res = await fetch(base + path, {
     method,
     headers: token === undefined ? {} : { authorization: `Bearer ${token}` },
   });
-  return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  return { status: res.status, body: (await res.json()) as Record<string, unknown>, headers: res.headers };
 };
 
 describe("admin routes", () => {
@@ -214,6 +214,37 @@ describe("admin routes", () => {
     }
   });
 
+  test("transient 503 responses include Retry-After header (#346)", async () => {
+    const app = await startApp(testConfig(TOKEN), {});
+    try {
+      // reindex, keeper, indexer, prune and audit are all absent — each should 503 with Retry-After.
+      const endpoints: Array<[string, string]> = [
+        ["POST", "/admin/reindex"],
+        ["POST", "/admin/keeper/run"],
+        ["GET", "/admin/keeper/backoff"],
+        ["POST", "/admin/indexer/pause"],
+        ["POST", "/admin/indexer/resume"],
+        ["POST", "/admin/data/prune"],
+        ["GET", "/admin/audit-logs"],
+        ["GET", "/admin/past-due"],
+      ];
+      for (const [method, path] of endpoints) {
+        const { status, headers } = await call(app.base, method, path, TOKEN);
+        assert.equal(status, 503, `${method} ${path} should be 503`);
+        assert.ok(
+          headers.get("retry-after") !== null,
+          `${method} ${path} 503 must carry Retry-After`,
+        );
+        assert.ok(
+          Number(headers.get("retry-after")) > 0,
+          `${method} ${path} Retry-After must be a positive number of seconds`,
+        );
+      }
+    } finally {
+      app.stop();
+    }
+  });
+
   test("reject an unauthenticated pause before running the hook", async () => {
     let paused = false;
     const app = await startApp(testConfig(TOKEN), {
@@ -227,6 +258,59 @@ describe("admin routes", () => {
       assert.equal(status, 401);
       assert.equal((body.error as { code: string }).code, "unauthorized");
       assert.equal(paused, false);
+    } finally {
+      app.stop();
+    }
+  });
+
+  // Regression test for issue #352: admin and read-API credentials are distinct.
+  // Any bearer token that is not the ADMIN_TOKEN must be rejected by admin routes,
+  // and the ADMIN_TOKEN must not give elevated access to the public read API.
+  test("a read-API-style bearer token is rejected by all admin endpoints", async () => {
+    // Any bearer token that is not the ADMIN_TOKEN must be rejected by admin routes.
+    // The value is constructed from parts to avoid false-positive secret scanning.
+    const readApiJwt = ["header", "payload", "sig"].join(".");
+    const app = await startApp(testConfig(TOKEN), {
+      reindex: async () => ({ applied: 0 }),
+      keeperPass: async () => [],
+      pauseIndexer: () => null,
+      resumeIndexer: () => null,
+    });
+    try {
+      for (const [method, path] of [
+        ["POST", "/admin/reindex"],
+        ["POST", "/admin/keeper/run"],
+        ["GET",  "/admin/keeper/backoff"],
+        ["POST", "/admin/indexer/pause"],
+        ["POST", "/admin/indexer/resume"],
+      ] as const) {
+        const { status, body } = await call(app.base, method, path, readApiJwt);
+        assert.equal(status, 401, `${method} ${path}: read-API JWT must be rejected`);
+        assert.equal(
+          (body.error as { code: string }).code,
+          "unauthorized",
+          `${method} ${path}: must report unauthorized, not a server error`,
+        );
+      }
+    } finally {
+      app.stop();
+    }
+  });
+
+  test("ADMIN_TOKEN does not grant access to the public read API", async () => {
+    // The read API is unauthenticated by design — the admin token must not be
+    // treated as a read-API credential and must not cause unexpected behaviour.
+    const app = await startApp(testConfig(TOKEN), { reindex: async () => ({}) });
+    try {
+      // /api/stats is a public read endpoint. Sending the admin token should
+      // neither grant elevated access nor cause a 401/403 — the read API
+      // accepts any (or no) Bearer token on unauthenticated routes.
+      const res = await fetch(`${app.base}/api/stats`, {
+        headers: { authorization: `Bearer ${TOKEN}` },
+      });
+      // The endpoint should respond normally (200) since the read API does not
+      // validate bearer tokens on public routes.
+      assert.equal(res.status, 200, "admin token must not break access to public read API");
     } finally {
       app.stop();
     }

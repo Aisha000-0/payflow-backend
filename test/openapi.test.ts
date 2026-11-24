@@ -160,6 +160,15 @@ describe("the OpenAPI document", () => {
     assert.ok(spec.info.version.length > 0);
   });
 
+  test("documents the maintained plan subscriber count", async () => {
+    const spec = await getSpec();
+    const plan = spec.components?.schemas?.Plan;
+    const details = plan?.allOf?.[1];
+    assert.equal(details?.properties?.activeSubscribers?.type, "integer");
+    assert.ok(details?.required?.includes("activeSubscribers"));
+    assert.match(spec.paths["/api/plans"]?.get?.description ?? "", /distinct subscribers/);
+  });
+
   test("covers every route Express serves", async () => {
     const spec = await getSpec();
     const routes = appRoutes(app);
@@ -226,6 +235,29 @@ describe("the OpenAPI document", () => {
     // The second network's routes are the same ones under its own segment.
     assert.ok("/api/mainnet/plans" in spec.paths);
     assert.ok("/api/mainnet/merchants/{address}/summary" in spec.paths);
+  });
+
+  test("documents the versioned API beside its unversioned alias", async () => {
+    const spec = await getSpec();
+    for (const path of [
+      "/api/v1/plans",
+      "/api/v1/plans/{id}/stats",
+      "/api/v1/mandates/{id}/charges",
+      "/api/v1/openapi.json",
+      "/api/v1/mainnet/plans",
+      "/api/plans",
+      "/api/mainnet/plans",
+    ]) {
+      assert.ok(path in spec.paths, `${path} is missing from the OpenAPI document`);
+    }
+    // The two surfaces describe the same operation without sharing an id, so
+    // a generated client can tell the versioned route from the alias.
+    assert.notEqual(
+      spec.paths["/api/v1/plans"]?.get?.operationId,
+      spec.paths["/api/plans"]?.get?.operationId,
+    );
+    assert.match(spec.servers?.[0]?.description ?? "", /\/api\/v1/);
+    assert.match(spec.info.description ?? "", /versioned/);
   });
 
   test("documents the operator routes behind their bearer token", async () => {
